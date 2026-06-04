@@ -205,12 +205,15 @@ def build_executable(
     onedir: bool = False,
     dist_dir: str | None = None,
     python_exe: str | None = None,
+    checker: bool = False,
 ) -> bool:
     python_exe = python_exe or sys.executable
     arch = get_python_arch_for(python_exe)
-    output_name = f"MailExporter_x{arch}"
+    output_name = f"ExportChecker_x{arch}" if checker else f"MailExporter_x{arch}"
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    main_script = os.path.join(script_dir, "eml_to_pst_converter.py")
+    main_script = os.path.join(
+        script_dir, "export_checker.py" if checker else "eml_to_pst_converter.py"
+    )
     build_dir = os.path.join(script_dir, "build", output_name)
     if dist_dir is None:
         dist_dir = os.path.join(script_dir, "dist")
@@ -236,11 +239,12 @@ def build_executable(
         print(f"Error: {main_script} not found")
         return False
 
+    window_flag = "--console" if checker else "--windowed"
     cmd = [
         python_exe,
         "-m",
         "PyInstaller",
-        "--windowed",
+        window_flag,
         f"--name={output_name}",
         f"--distpath={dist_dir}",
         f"--workpath={build_dir}",
@@ -340,6 +344,7 @@ def build_for_arch(
     onedir: bool,
     dist_dir: str,
     python_exe: str | None = None,
+    checker: bool = False,
 ) -> bool:
     if python_exe is None:
         python_exe = resolve_python_for_arch(target_arch)
@@ -358,7 +363,12 @@ def build_for_arch(
             f"expected {target_arch}-bit"
         )
         return False
-    return build_executable(onedir=onedir, dist_dir=dist_dir, python_exe=python_exe)
+    return build_executable(
+        onedir=onedir,
+        dist_dir=dist_dir,
+        python_exe=python_exe,
+        checker=checker,
+    )
 
 
 def main() -> int:
@@ -387,6 +397,11 @@ def main() -> int:
         default=None,
         help="Explicit Python executable (only with --arch; overrides auto-detect)",
     )
+    parser.add_argument(
+        "--checker",
+        action="store_true",
+        help="Build ExportChecker_x32/x64.exe (PST validation CLI) instead of MailExporter",
+    )
     args = parser.parse_args()
 
     if args.python and args.arch is None:
@@ -400,8 +415,9 @@ def main() -> int:
         dist_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist")
 
     archs = [args.arch] if args.arch is not None else [32, 64]
+    product = "ExportChecker" if args.checker else "MailExporter"
     if len(archs) == 2:
-        print("Building both 32-bit and 64-bit MailExporter executables...\n")
+        print(f"Building both 32-bit and 64-bit {product} executables...\n")
 
     python_exe = None
     if args.python:
@@ -419,6 +435,7 @@ def main() -> int:
             onedir=args.onedir,
             dist_dir=dist_dir,
             python_exe=python_exe,
+            checker=args.checker,
         )
         if not ok:
             all_ok = False
@@ -426,10 +443,12 @@ def main() -> int:
     if all_ok:
         clean_build_artifacts()
         if len(archs) == 2:
+            n32 = f"{product}_x32.exe"
+            n64 = f"{product}_x64.exe"
             print(
                 "\nBoth builds succeeded:\n"
-                f"  {os.path.join(dist_dir, 'MailExporter_x32.exe')}\n"
-                f"  {os.path.join(dist_dir, 'MailExporter_x64.exe')}"
+                f"  {os.path.join(dist_dir, n32)}\n"
+                f"  {os.path.join(dist_dir, n64)}"
             )
     return 0 if all_ok else 1
 

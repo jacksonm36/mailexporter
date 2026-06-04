@@ -58,6 +58,22 @@ PyInstaller apps are often flagged by **Windows Defender** or other antivirus. T
 
 After export, check **`export_results.csv`** and **`export.log`** next to the PST (or source folder for mailbox mode). A copy is also written to **`export_log.txt`** for older workflows.
 
+### Validate export quality (checker)
+
+Use **`export_checker.py`** (or build **`ExportChecker_x32.exe`** with `python build_exe.py --checker`) on the same PC as Outlook to find blank **None** rows, raw HTML in the preview, missing attachments, and mismatches vs source `.eml` files:
+
+```bash
+python export_checker.py --pst C:\path\to\export.pst
+python export_checker.py --pst export.pst --folder "Account (user@domain" --issues-only
+python export_checker.py --pst export.pst --csv export_results.csv --compare-eml
+```
+
+Writes **`validation_report_<pst>_<timestamp>.csv`** next to the PST. Exit code **1** if any message has **error**-level issues (re-import recommended after updating Mail Exporter).
+
+**During export**, each message is validated immediately after it lands in the PST (default **ON**): correct **folder** (Inbox/Sent/… under the right account path), correct **PST store**, sender/subject must not be blank/`None`, HTML must not show as raw tags, attachments must match the `.eml`. Failed items are repaired automatically (including **Move** into the right folder); if still bad, the app deletes them and retries via `Items.Add`, or records an error in `export_results.csv`. Disable with `EML2PST_VALIDATE_IMPORT=0`.
+
+If **Outlook crashes or hangs**, export **pauses** and polls until `OUTLOOK.EXE` is healthy again (default wait up to 1 hour, `EML2PST_OUTLOOK_WAIT_MAX`). Restart Outlook manually if needed; the run resumes on the current file when COM reconnects.
+
 ## Build from source (developers only)
 
 ```bash

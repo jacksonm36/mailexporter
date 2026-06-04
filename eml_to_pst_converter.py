@@ -28,7 +28,8 @@ import struct
 import shutil
 import sqlite3
 from pathlib import Path
-from email.utils import parsedate_to_datetime
+from email.header import decode_header
+from email.utils import parseaddr, parsedate_to_datetime
 
 from i18n import (
     LANG_EN,
@@ -37,6 +38,16 @@ from i18n import (
     detect_default_lang,
     lang_from_display,
     t,
+)
+from mail_validation import (
+    ISSUE_WRONG_FOLDER,
+    ISSUE_WRONG_PST_STORE,
+    append_folder_placement_issues,
+    eml_parse_to_summary,
+    format_inspection_errors,
+    has_import_errors,
+    read_outlook_mail_snapshot,
+    validate_import_against_eml,
 )
 
 
@@ -323,6 +334,14 @@ MAX_ATTACHMENT_BYTES = _env_int_mb("EML2PST_MAX_ATTACHMENT_MB", 25) * 1024 * 102
 NATIVE_IMPORT_MAX_BYTES = _env_int_mb("EML2PST_NATIVE_MAX_MB", 384) * 1024 * 1024
 NATIVE_IMPORT_SNIFF_BYTES = _env_int("EML2PST_NATIVE_SNIFF", 262144, lo=8192, hi=1_048_576)
 FULL_DEDUP_HASH = os.environ.get("EML2PST_FULL_DEDUP", "").strip().lower() in ("1", "true", "yes")
+VALIDATE_IMPORT = os.environ.get("EML2PST_VALIDATE_IMPORT", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+OUTLOOK_CRASH_WAIT_MAX = _env_int("EML2PST_OUTLOOK_WAIT_MAX", 3600, lo=60, hi=86_400)
+OUTLOOK_CRASH_WAIT_POLL = _env_float("EML2PST_OUTLOOK_WAIT_POLL", 5.0, lo=2.0, hi=60.0)
 PREFLIGHT_SIZE_SAMPLE = _env_int("EML2PST_PREFLIGHT_SAMPLE", 200, lo=50, hi=5000)
 DEDUP_BACKEND_MODE = os.environ.get("EML2PST_DEDUP_BACKEND", "auto").strip().lower()
 DEDUP_SQLITE_THRESHOLD = _env_int("EML2PST_DEDUP_SQLITE_THRESHOLD", 200_000, lo=10_000, hi=500_000)
@@ -330,6 +349,21 @@ DEDUP_SQLITE_COMMIT_EVERY = _env_int("EML2PST_DEDUP_SQLITE_COMMIT_EVERY", 500, l
 DEDUP_DB_FILENAME = "dedup_state.sqlite3"
 # Date: header in the first 64KB of each message (dedup keys must not ignore send time).
 _DATE_HEADER_BYTES_RE = re.compile(br"^Date:\s*(.+)$", re.MULTILINE | re.IGNORECASE)
+# Attachment sniff: HTML multipart uses Content-Disposition: inline without filename — not a file.
+_ATTACHMENT_DISPOSITION_SNIFF_RE = re.compile(
+    br"content-disposition\s*:\s*attachment\b",
+    re.IGNORECASE,
+)
+_INLINE_NAMED_DISPOSITION_SNIFF_RE = re.compile(
+    br"content-disposition\s*:\s*inline\b[^\r\n]{0,240}?filename\s*=",
+    re.IGNORECASE,
+)
+_BINARY_PART_CONTENT_TYPE_SNIFF_RE = re.compile(
+    rb"content-type\s*:\s*(?:application/(?:pdf|zip|x-zip|octet-stream)|image/(?:png|jpeg|jpg|gif))\b",
+    re.IGNORECASE,
+)
+# HTML fragments without <html>/<body> (common in WLM / invoice templates).
+_HTML_TAG_FRAGMENT_RE = re.compile(r"</?[a-zA-Z][^>]{0,240}>", re.I)
 _BINARY_BODY_SIGNATURES = (
     b"%PDF-",
     b"\x89PNG\r\n\x1a\n",
@@ -396,11 +430,50 @@ def _is_outlook_rpc_error(exc) -> bool:
         "RPC server is unavailable",
         "2147023174",
         "2147944122",
+        "800706ba",
+        "80080005",
+        "80040154",
+        "800706be",
         "Call was rejected by callee",
         "Server execution failed",
         "The message filter indicated",
+        "Operation unavailable",
+        "application is not running",
+        "Invalid class string",
+        "CoCreateInstance",
+        "remote procedure call failed",
+        "disconnected",
+        "connection is invalid",
+        "Outlook is not running",
     )
-    return any(m in text for m in markers)
+    return any(m.lower() in text.lower() for m in markers)
+
+
+def _is_outlook_unavailable_error(exc) -> bool:
+    """True when Outlook crashed, hung, or COM must be re-established."""
+    return _is_outlook_rpc_error(exc)
+
+
+def _outlook_process_running() -> bool:
+    """True when OUTLOOK.EXE is present (Windows)."""
+    if sys.platform != "win32":
+        return True
+    try:
+        out = subprocess.run(
+            [
+                "tasklist",
+                "/FI",
+                "IMAGENAME eq OUTLOOK.EXE",
+                "/NH",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return "OUTLOOK.EXE" in (out.stdout or "").upper()
+    except (OSError, subprocess.SubprocessError):
+        return True
 
 
 def _is_outlook_path_open_error(exc) -> bool:
@@ -1632,7 +1705,164 @@ class EmlToPstConverter:
                 log_sanitize(e),
             )
             return None
-            
+
+    @staticmethod
+    def _outlook_text_is_blank(value) -> bool:
+        """True when an Outlook/COM field is empty or the literal string 'None'."""
+        if value is None:
+            return True
+        text = str(value).strip()
+        return not text or text.lower() == "none"
+
+    @staticmethod
+    def _body_looks_like_html(body: str) -> bool:
+        if not body or text_looks_binary(body):
+            return False
+        sample = body.lstrip()[:8192].lower()
+        if sample.startswith("<!doctype") or "<html" in sample or "<body" in sample:
+            return True
+        return bool(_HTML_TAG_FRAGMENT_RE.search(body))
+
+    @staticmethod
+    def _normalize_html_body_for_outlook(body: str) -> str:
+        """Wrap HTML fragments so Outlook renders them instead of showing raw tags."""
+        body = body.strip()
+        if not body:
+            return body
+        if "<html" not in body.lower():
+            body = (
+                "<!DOCTYPE html><html><head>"
+                '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">'
+                f"</head><body>{body}</body></html>"
+            )
+        return body
+
+    def _resolve_from_header(self, msg) -> str:
+        """Best-effort From for WLM exports (From, Sender, Reply-To, Return-Path, …)."""
+        if msg is None:
+            return ""
+        for key in (
+            "From",
+            "Sender",
+            "Reply-To",
+            "Return-Path",
+            "X-Sender",
+            "X-Original-From",
+            "X-Authenticated-User",
+        ):
+            raw = msg.get(key)
+            if not raw:
+                continue
+            decoded = self._decode_mime_header_field(raw)
+            if decoded:
+                display, addr = parseaddr(decoded)
+                if addr or display:
+                    return decoded
+        return ""
+
+    @staticmethod
+    def _decode_mime_header_field(value) -> str:
+        """Decode RFC 2047 Subject/From and repair common UTF-8/Latin-1 mojibake."""
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        text = str(value).strip()
+        if not text:
+            return ""
+        try:
+            chunks: list[str] = []
+            for fragment, charset in decode_header(text):
+                if isinstance(fragment, bytes):
+                    enc = charset or "utf-8"
+                    try:
+                        chunks.append(fragment.decode(enc, errors="replace"))
+                    except LookupError:
+                        chunks.append(fragment.decode("utf-8", errors="replace"))
+                else:
+                    chunks.append(str(fragment))
+            text = "".join(chunks).strip()
+        except Exception:
+            pass
+        if "Ã" in text or "â€" in text:
+            try:
+                repaired = text.encode("latin-1", errors="ignore").decode(
+                    "utf-8", errors="replace"
+                )
+                if repaired.strip():
+                    text = repaired.strip()
+            except Exception:
+                pass
+        return text
+
+    def _apply_sender_from_parsed_from(
+        self, mail, from_raw: str, *, is_sent_message: bool
+    ) -> None:
+        """Set Outlook sender fields so the message list is not blank / 'None'."""
+        from_raw = self._decode_mime_header_field(from_raw)
+        if not from_raw:
+            return
+        display, addr = parseaddr(from_raw)
+        display = self._decode_mime_header_field(display) or display.strip()
+        addr = (addr or "").strip()
+        if not addr and "@" in from_raw:
+            m = re.search(r"[\w.\-+]+@[\w.\-]+\.\w+", from_raw)
+            if m:
+                addr = m.group(0)
+        if not display and addr:
+            display = addr
+        if not display and not addr:
+            return
+        try:
+            if is_sent_message:
+                mail.SentOnBehalfOfName = display or from_raw
+                if addr:
+                    try:
+                        mail.SentOnBehalfOfEmailAddress = addr
+                    except Exception:
+                        pass
+            else:
+                if self._outlook_text_is_blank(getattr(mail, "SenderName", None)):
+                    mail.SenderName = display or addr or from_raw
+                if addr and self._outlook_text_is_blank(
+                    getattr(mail, "SenderEmailAddress", None)
+                ):
+                    mail.SenderEmailAddress = addr
+                    try:
+                        mail.SenderEmailType = "SMTP"
+                    except Exception:
+                        pass
+        except (AttributeError, TypeError) as e:
+            logger.debug("Could not set sender properties: %s", e)
+
+    def _copy_sender_from_mail_item(
+        self, dest_mail, source_mail, *, is_sent_message: bool
+    ) -> None:
+        """Copy non-blank sender fields from an OpenSharedItem mail item."""
+        if self._outlook_text_is_blank(getattr(dest_mail, "SenderName", None)):
+            try:
+                name = getattr(source_mail, "SenderName", None)
+                if not self._outlook_text_is_blank(name):
+                    if is_sent_message:
+                        dest_mail.SentOnBehalfOfName = name
+                    else:
+                        dest_mail.SenderName = name
+            except Exception:
+                pass
+        if not is_sent_message and self._outlook_text_is_blank(
+            getattr(dest_mail, "SenderEmailAddress", None)
+        ):
+            try:
+                addr = getattr(source_mail, "SenderEmailAddress", None)
+                if not self._outlook_text_is_blank(addr):
+                    dest_mail.SenderEmailAddress = addr
+                    try:
+                        dest_mail.SenderEmailType = "SMTP"
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
     def parse_eml(self, file_path):
         """
         Parse an EML file and return email data.
@@ -1643,11 +1873,12 @@ class EmlToPstConverter:
             with open(file_path, 'rb') as f:
                 msg = BytesParser(policy=policy.default).parse(f)
             
+            subject = self._decode_mime_header_field(msg.get("Subject"))
             return {
-                'subject': msg.get('Subject', '(No Subject)'),
-                'from': msg.get('From', ''),
-                'to': msg.get('To', ''),
-                'cc': msg.get('Cc', ''),
+                'subject': subject or "(No Subject)",
+                'from': self._resolve_from_header(msg),
+                'to': self._decode_mime_header_field(msg.get("To")),
+                'cc': self._decode_mime_header_field(msg.get("Cc")),
                 'date': msg.get('Date', ''),
                 'body': self.get_email_body(msg),
                 'attachments': self.get_attachments(msg),
@@ -1830,6 +2061,12 @@ class EmlToPstConverter:
         return results
 
     def _sniff_eml_has_attachments(self, file_path: str) -> bool:
+        """
+        True when the .eml likely has a real file attachment (not HTML inline parts).
+
+        WLM/HTML mail often has Content-Disposition: inline on text/html only — that
+        must not trigger the 'attachments but none imported' warning.
+        """
         try:
             with open(file_path, "rb") as handle:
                 head = handle.read(min(os.path.getsize(file_path), NATIVE_IMPORT_SNIFF_BYTES))
@@ -1837,21 +2074,12 @@ class EmlToPstConverter:
             return False
         if not head:
             return False
-        lower = head.lower()
-        if b"content-disposition:" in lower and (
-            b"attachment" in lower or b"inline" in lower
-        ):
+        if _ATTACHMENT_DISPOSITION_SNIFF_RE.search(head):
             return True
-        for marker in (
-            b"application/pdf",
-            b"application/zip",
-            b"application/x-zip",
-            b"image/png",
-            b"image/jpeg",
-            b"application/octet-stream",
-        ):
-            if marker in lower:
-                return True
+        if _INLINE_NAMED_DISPOSITION_SNIFF_RE.search(head):
+            return True
+        if _BINARY_PART_CONTENT_TYPE_SNIFF_RE.search(head):
+            return True
         return False
 
     def _apply_attachment_chain(
@@ -1893,10 +2121,75 @@ class EmlToPstConverter:
         """Set Body/HTMLBody only when content is safe readable text."""
         if not body or text_looks_binary(body):
             return
-        if "<html" in body.lower() or "<body" in body.lower():
-            mail.HTMLBody = body
+        if self._body_looks_like_html(body):
+            mail.HTMLBody = self._normalize_html_body_for_outlook(body)
         else:
             mail.Body = body
+
+    def _apply_parsed_display_fields(
+        self,
+        mail,
+        email_data: dict | None,
+        source_file_path: str | None,
+        conversion_options: dict,
+        *,
+        outlook_source_mail=None,
+    ) -> None:
+        """
+        Apply Subject, recipients, HTML/plain body, and sender from parsed .eml.
+
+        Staged OpenSharedItem imports often leave blank or literal 'None' list fields;
+        always overlay parsed MIME metadata after the item exists in the PST.
+        """
+        if not email_data:
+            return
+        subject = (email_data.get("subject") or "").strip()
+        if subject and subject != "(No Subject)":
+            try:
+                if self._outlook_text_is_blank(getattr(mail, "Subject", None)):
+                    mail.Subject = subject
+            except Exception as e:
+                logger.debug("Could not set Subject: %s", e)
+        elif self._outlook_text_is_blank(getattr(mail, "Subject", None)):
+            try:
+                mail.Subject = "(No Subject)"
+            except Exception:
+                pass
+
+        for key, prop in (("to", "To"), ("cc", "CC")):
+            val = (email_data.get(key) or "").strip()
+            if not val:
+                continue
+            try:
+                if self._outlook_text_is_blank(getattr(mail, prop, None)):
+                    setattr(mail, prop, val)
+            except Exception as e:
+                logger.debug("Could not set %s: %s", prop, e)
+
+        self._copy_body_to_mail_item(
+            mail, outlook_source_mail or mail, email_data
+        )
+
+        sent_state = None
+        if source_file_path:
+            sent_state = self._sent_state_for_source_path(
+                source_file_path, conversion_options
+            )
+        from_raw = (email_data.get("from") or "").strip()
+        if not from_raw and email_data.get("message") is not None:
+            from_raw = self._resolve_from_header(email_data["message"])
+        if from_raw:
+            self._apply_sender_from_parsed_from(
+                mail,
+                from_raw,
+                is_sent_message=(sent_state is True),
+            )
+        elif outlook_source_mail is not None:
+            self._copy_sender_from_mail_item(
+                mail,
+                outlook_source_mail,
+                is_sent_message=(sent_state is True),
+            )
 
     def _copy_body_to_mail_item(self, dest_mail, source_mail, parsed_email: dict | None) -> None:
         """
@@ -2586,6 +2879,7 @@ class EmlToPstConverter:
                 resume_from_log=bool(self.resume_from_log.get()),
             ),
             "pst_chunk_size": PST_CHUNK_SIZE,
+            "validate_import": VALIDATE_IMPORT,
         }
 
         if conversion_options["pst_option"] == "mailbox":
@@ -2746,6 +3040,20 @@ class EmlToPstConverter:
             self.processed_hashes.clear()
             self._dup_fingerprints.clear()
         self._init_dedup_backend(conversion_options)
+        self._import_validation_repairs = 0
+        self._import_validation_rebuilds = 0
+        self._import_validation_failures = 0
+        if conversion_options.get("validate_import", VALIDATE_IMPORT):
+            logger.info(
+                "Per-message import validation: ON (folder placement, sender/subject, "
+                "HTML, attachments; set EML2PST_VALIDATE_IMPORT=0 to disable)"
+            )
+            logger.info(
+                "Outlook crash recovery: wait up to %ds for Outlook.exe (EML2PST_OUTLOOK_WAIT_MAX)",
+                OUTLOOK_CRASH_WAIT_MAX,
+            )
+        else:
+            logger.info("Per-message import validation: OFF")
         
         cancelled = False
         try:
@@ -3025,6 +3333,8 @@ class EmlToPstConverter:
             except Exception as e:
                 raise RuntimeError(f"Could not access MAPI namespace: {e}") from e
 
+            conversion_options["_session_outlook"] = outlook
+
             if export_mode != "mailbox":
                 pst_path = normalize_pst_path(pst_path)
                 conversion_options["destination_path"] = pst_path
@@ -3124,6 +3434,20 @@ class EmlToPstConverter:
             log_path = conversion_options.get("log_path", "")
             if log_path:
                 note += t(lang, "note_log_saved", path=log_path)
+            repairs = getattr(self, "_import_validation_repairs", 0)
+            rebuilds = getattr(self, "_import_validation_rebuilds", 0)
+            val_fail = getattr(self, "_import_validation_failures", 0)
+            if repairs or rebuilds or val_fail:
+                note += (
+                    f"\nImport validation: {repairs} repaired, "
+                    f"{rebuilds} rebuilt, {val_fail} failed."
+                )
+                logger.info(
+                    "Import validation summary: %d repaired, %d rebuilt, %d failed",
+                    repairs,
+                    rebuilds,
+                    val_fail,
+                )
                 
             if cancelled:
                 self.root.after(
@@ -4055,6 +4379,177 @@ class EmlToPstConverter:
             )
         return False
 
+    def _import_validation_enabled(self, conversion_options: dict) -> bool:
+        if conversion_options.get("_skip_import_validation"):
+            return False
+        return bool(conversion_options.get("validate_import", VALIDATE_IMPORT))
+
+    def _validate_imported_mail_item(
+        self,
+        mail,
+        file_path: str,
+        conversion_options: dict,
+        email_data: dict | None = None,
+        *,
+        expected_folder=None,
+    ):
+        if email_data is None:
+            email_data = self.parse_eml(file_path)
+        summary = eml_parse_to_summary(email_data, file_path)
+        snapshot = read_outlook_mail_snapshot(mail)
+        inspection = validate_import_against_eml(
+            snapshot, summary, source=file_path
+        )
+        if expected_folder is not None:
+            self._append_folder_placement_validation(
+                inspection, mail, expected_folder, conversion_options
+            )
+        return inspection
+
+    def _repair_imported_mail_item(
+        self,
+        mail,
+        file_path: str,
+        conversion_options: dict,
+        email_data: dict | None = None,
+        *,
+        expected_folder=None,
+    ) -> None:
+        if email_data is None:
+            email_data = self.parse_eml(file_path)
+        if expected_folder is not None:
+            moved = self._relocate_mail_to_dest_folder(mail, expected_folder)
+            if moved is not None:
+                mail = moved
+        if not email_data:
+            try:
+                mail.Save()
+            except Exception:
+                pass
+            return
+        self._apply_parsed_display_fields(
+            mail, email_data, file_path, conversion_options
+        )
+        self._apply_attachment_chain(
+            mail,
+            email_data=email_data,
+            source_file_path=file_path,
+        )
+        if expected_folder is not None:
+            moved = self._relocate_mail_to_dest_folder(mail, expected_folder)
+            if moved is not None:
+                mail = moved
+        try:
+            mail.Save()
+        except Exception as e:
+            logger.debug("Save after import repair: %s", e)
+
+    def _ensure_import_quality(
+        self,
+        mail,
+        file_path: str,
+        outlook,
+        target_folder,
+        conversion_options: dict,
+        *,
+        email_data: dict | None = None,
+        from_validation_rebuild: bool = False,
+        expected_folder=None,
+    ) -> str:
+        """
+        Validate PST/mailbox item right after import; repair or rebuild if misaligned.
+
+        Returns 'converted' or an error detail string (bad item removed when possible).
+        """
+        if not self._import_validation_enabled(conversion_options):
+            return "converted"
+
+        if email_data is None:
+            email_data = self.parse_eml(file_path)
+
+        inspection = self._validate_imported_mail_item(
+            mail,
+            file_path,
+            conversion_options,
+            email_data,
+            expected_folder=expected_folder,
+        )
+        if not has_import_errors(inspection):
+            return "converted"
+
+        detail = format_inspection_errors(inspection)
+        logger.warning(
+            "Import validation failed for %s — repairing (%s)",
+            log_sanitize(file_path),
+            detail,
+        )
+        self._repair_imported_mail_item(
+            mail,
+            file_path,
+            conversion_options,
+            email_data,
+            expected_folder=expected_folder,
+        )
+        inspection = self._validate_imported_mail_item(
+            mail,
+            file_path,
+            conversion_options,
+            email_data,
+            expected_folder=expected_folder,
+        )
+        if not has_import_errors(inspection):
+            self._import_validation_repairs = (
+                getattr(self, "_import_validation_repairs", 0) + 1
+            )
+            logger.info(
+                "Import validation repaired: %s",
+                log_sanitize(file_path),
+            )
+            return "converted"
+
+        detail = format_inspection_errors(inspection)
+        if (
+            not from_validation_rebuild
+            and self._export_targets_pst(conversion_options)
+            and outlook is not None
+        ):
+            try:
+                mail.Delete()
+            except Exception as e:
+                logger.debug("Delete invalid PST import: %s", e)
+            rebuild_opts = dict(conversion_options)
+            rebuild_opts["_skip_import_validation"] = False
+            rebuild = self._process_single_email_manual_fallback(
+                file_path,
+                target_folder,
+                outlook,
+                require_date_preservation=bool(
+                    conversion_options.get("strict_date_preservation")
+                ),
+                conversion_options=rebuild_opts,
+                try_staged_first=False,
+                from_validation_rebuild=True,
+            )
+            if rebuild == "converted":
+                self._import_validation_rebuilds = (
+                    getattr(self, "_import_validation_rebuilds", 0) + 1
+                )
+                logger.info(
+                    "Import rebuilt via Items.Add after validation: %s",
+                    log_sanitize(file_path),
+                )
+                return "converted"
+            return f"Import validation failed ({detail}); rebuild: {rebuild}"
+
+        try:
+            mail.Delete()
+        except Exception:
+            pass
+        self._import_validation_failures = (
+            getattr(self, "_import_validation_failures", 0) + 1
+        )
+        return f"Import validation failed: {detail}"
+
     def _import_eml_direct_to_pst_folder(
         self,
         file_path: str,
@@ -4084,7 +4579,7 @@ class EmlToPstConverter:
                 conversion_options.get("strict_date_preservation")
             ),
             conversion_options=conversion_options,
-            try_staged_first=False,
+            try_staged_first=True,
         )
 
     def _resolve_export_target_folder(self, namespace, conversion_options):
@@ -4103,15 +4598,202 @@ class EmlToPstConverter:
             raise RuntimeError(f"Could not access PST file. Path: {pst_path}")
         return self._get_or_create_inbox(pst_store)
 
-    def _recover_outlook_session(self, conversion_options):
-        """Reconnect Outlook COM after RPC/session failure."""
-        logger.warning("Outlook COM unavailable — pausing and reconnecting...")
-        time.sleep(COM_RPC_COOLDOWN)
-        gc.collect()
-        outlook = WIN32COM.Dispatch("Outlook.Application")
-        namespace = outlook.GetNamespace("MAPI")
-        target_folder = self._resolve_export_target_folder(namespace, conversion_options)
-        return outlook, namespace, target_folder
+    def _clear_pst_session_caches(self) -> None:
+        """Drop cached Outlook folder COM objects after reconnect or store churn."""
+        self._pst_standard_folder_cache.clear()
+        self._pst_std_folder_warn_logged.clear()
+        self._pst_std_folder_resolve_logged.clear()
+
+    def _outlook_folder_display_path(self, folder) -> str:
+        """Build a human-readable folder path (e.g. Inbox\\Account (user@domain))."""
+        parts: list[str] = []
+        current = folder
+        for _ in range(40):
+            try:
+                name = str(current.Name or "").strip()
+            except Exception:
+                break
+            if name:
+                parts.append(name)
+            try:
+                current = current.Parent
+            except Exception:
+                break
+            if current is None:
+                break
+        parts.reverse()
+        return "\\".join(parts)
+
+    def _mail_in_dest_folder(self, mail, dest_folder) -> tuple[bool, str, str]:
+        """True when the item's parent folder is the intended import folder."""
+        try:
+            parent = mail.Parent
+            if (
+                getattr(parent, "EntryID", None)
+                and getattr(dest_folder, "EntryID", None)
+                and parent.EntryID == dest_folder.EntryID
+            ):
+                path = self._outlook_folder_display_path(parent)
+                return True, path, path
+        except Exception:
+            pass
+        try:
+            actual = self._outlook_folder_display_path(mail.Parent)
+        except Exception:
+            actual = "?"
+        try:
+            expected = self._outlook_folder_display_path(dest_folder)
+        except Exception:
+            expected = "?"
+        if actual == expected:
+            return True, actual, expected
+        return False, actual, expected
+
+    def _append_folder_placement_validation(
+        self,
+        inspection,
+        mail,
+        dest_folder,
+        conversion_options: dict,
+    ) -> None:
+        pst_path = normalize_pst_path(conversion_options.get("destination_path") or "")
+        in_store = True
+        actual_store = self._mail_item_store_path(mail)
+        if pst_path and self._export_targets_pst(conversion_options):
+            in_store = self._message_in_expected_pst(mail, pst_path)
+        in_folder, actual_path, expected_path = self._mail_in_dest_folder(
+            mail, dest_folder
+        )
+        append_folder_placement_issues(
+            inspection,
+            in_correct_folder=in_folder,
+            actual_folder_path=actual_path,
+            expected_folder_path=expected_path,
+            in_correct_store=in_store,
+            actual_store=actual_store or "?",
+            expected_store=pst_path or "",
+        )
+
+    def _probe_outlook_application(self, outlook) -> bool:
+        """False when the Outlook COM server is not responding."""
+        try:
+            _ = outlook.Application.Version
+            namespace = outlook.GetNamespace("MAPI")
+            _ = namespace.Stores.Count
+            return True
+        except Exception:
+            return False
+
+    def _dispatch_outlook_application(self):
+        """Attach to a running Outlook or start one; raises on total failure."""
+        last_err = None
+        for attempt in range(3):
+            try:
+                try:
+                    outlook = WIN32COM.GetActiveObject("Outlook.Application")
+                except Exception:
+                    outlook = WIN32COM.Dispatch("Outlook.Application")
+                if self._probe_outlook_application(outlook):
+                    return outlook
+            except Exception as e:
+                last_err = e
+            time.sleep(COM_RPC_COOLDOWN * (attempt + 1))
+        if last_err:
+            raise last_err
+        raise RuntimeError("Could not connect to Outlook")
+
+    def _ui_set_status(self, text: str) -> None:
+        try:
+            self.root.after(0, lambda: self.status_label.config(text=text))
+        except Exception:
+            pass
+
+    def _recover_outlook_session(self, conversion_options, *, lang: str | None = None):
+        """
+        Wait for Outlook to recover after crash/hang, then reconnect COM.
+
+        Export pauses in a loop until Outlook responds or the user cancels.
+        """
+        if lang is None:
+            lang = conversion_options.get("lang", LANG_EN)
+        logger.warning(
+            "Outlook unavailable — export paused until Outlook is healthy "
+            "(max wait %ds, poll every %.0fs)",
+            OUTLOOK_CRASH_WAIT_MAX,
+            OUTLOOK_CRASH_WAIT_POLL,
+        )
+        self._ui_set_status(t(lang, "status_waiting_outlook"))
+        self._flush_export_log()
+        deadline = time.monotonic() + OUTLOOK_CRASH_WAIT_MAX
+        last_log = 0.0
+        while time.monotonic() < deadline:
+            if self._is_cancelled():
+                raise RuntimeError("Cancel requested while waiting for Outlook")
+            if not _outlook_process_running():
+                now = time.monotonic()
+                if now - last_log >= 30.0:
+                    logger.warning(
+                        "Outlook.exe is not running — start or restart Outlook; "
+                        "export will continue automatically when it is back"
+                    )
+                    last_log = now
+            else:
+                try:
+                    gc.collect()
+                    self._clear_pst_session_caches()
+                    outlook = self._dispatch_outlook_application()
+                    try:
+                        outlook.DisplayAlerts = False
+                    except Exception:
+                        pass
+                    namespace = outlook.GetNamespace("MAPI")
+                    target_folder = self._resolve_export_target_folder(
+                        namespace, conversion_options
+                    )
+                    logger.info("Outlook reconnected — resuming export")
+                    self._ui_set_status(t(lang, "status_outlook_resumed"))
+                    conversion_options["_session_outlook"] = outlook
+                    return outlook, namespace, target_folder
+                except Exception as e:
+                    now = time.monotonic()
+                    if now - last_log >= 30.0:
+                        logger.warning(
+                            "Outlook not ready yet (%s) — still waiting...",
+                            log_sanitize(e),
+                        )
+                        last_log = now
+            time.sleep(OUTLOOK_CRASH_WAIT_POLL)
+        raise RuntimeError(
+            f"Outlook did not recover within {OUTLOOK_CRASH_WAIT_MAX}s — "
+            "restart Outlook and resume the export"
+        )
+
+    def _refresh_outlook_session_after_failure(
+        self,
+        session: dict,
+        conversion_options: dict,
+        folder_cache: dict,
+        *,
+        lang: str,
+        consecutive_failures: int = 1,
+    ) -> None:
+        extra_pause = COM_RPC_COOLDOWN * min(consecutive_failures, 4)
+        if extra_pause > COM_RPC_COOLDOWN:
+            logger.warning(
+                "Repeated Outlook failures (%d) — extra pause %.1fs",
+                consecutive_failures,
+                extra_pause,
+            )
+            time.sleep(extra_pause - COM_RPC_COOLDOWN)
+        session["outlook"], session["namespace"], session["target_folder"] = (
+            self._recover_outlook_session(conversion_options, lang=lang)
+        )
+        try:
+            session["outlook"].DisplayAlerts = False
+        except Exception:
+            pass
+        conversion_options["_session_outlook"] = session["outlook"]
+        folder_cache.clear()
 
     def _should_use_pst_chunks(self, conversion_options: dict, file_count: int) -> bool:
         """True when importing into a PST in batches (direct import into final PST)."""
@@ -4365,11 +5047,30 @@ class EmlToPstConverter:
             progress_total,
         )
         self._flush_export_log()
+        lang = conversion_options.get("lang", LANG_EN)
         for i, file_path in enumerate(files_to_process):
             if self._is_cancelled():
                 cancelled = True
                 logger.info("Cancel requested — stopping after %d/%d", i, total)
                 break
+
+            if not self._probe_outlook_application(session["outlook"]):
+                try:
+                    self._refresh_outlook_session_after_failure(
+                        session,
+                        conversion_options,
+                        folder_cache,
+                        lang=lang,
+                        consecutive_failures=consecutive_rpc_failures + 1,
+                    )
+                    consecutive_rpc_failures = 0
+                except Exception as wait_err:
+                    errors += 1
+                    error_messages.append(
+                        f"{os.path.basename(file_path)}: {wait_err}"
+                    )
+                    logger.error("Outlook recovery failed: %s", wait_err)
+                    break
 
             current_file = os.path.basename(file_path)
             started = time.perf_counter()
@@ -4385,20 +5086,21 @@ class EmlToPstConverter:
                     session["outlook"],
                     conversion_options,
                 )
-                if status == "error" and _is_outlook_rpc_error(detail):
+                if status == "error" and _is_outlook_unavailable_error(detail):
                     consecutive_rpc_failures += 1
-                    extra_pause = COM_RPC_COOLDOWN * min(consecutive_rpc_failures, 4)
-                    if extra_pause > COM_RPC_COOLDOWN:
-                        logger.warning(
-                            "Repeated Outlook RPC failures (%d) — pausing %.1fs before reconnect",
-                            consecutive_rpc_failures,
-                            extra_pause,
+                    try:
+                        self._refresh_outlook_session_after_failure(
+                            session,
+                            conversion_options,
+                            folder_cache,
+                            lang=lang,
+                            consecutive_failures=consecutive_rpc_failures,
                         )
-                        time.sleep(extra_pause - COM_RPC_COOLDOWN)
-                    session["outlook"], session["namespace"], session["target_folder"] = (
-                        self._recover_outlook_session(conversion_options)
-                    )
-                    folder_cache.clear()
+                    except Exception as wait_err:
+                        errors += 1
+                        error_messages.append(f"{current_file}: {wait_err}")
+                        logger.error("Outlook recovery failed: %s", wait_err)
+                        break
                     dest_folder, target_label = self._resolve_target_folder_for_file(
                         session["target_folder"], file_path, conversion_options, folder_cache
                     )
@@ -4425,14 +5127,21 @@ class EmlToPstConverter:
                 )
             except Exception as e:
                 duration = time.perf_counter() - started
-                if _is_outlook_rpc_error(e):
+                if _is_outlook_unavailable_error(e):
+                    consecutive_rpc_failures += 1
                     try:
-                        session["outlook"], session["namespace"], session["target_folder"] = (
-                            self._recover_outlook_session(conversion_options)
+                        self._refresh_outlook_session_after_failure(
+                            session,
+                            conversion_options,
+                            folder_cache,
+                            lang=lang,
+                            consecutive_failures=consecutive_rpc_failures,
                         )
-                        folder_cache.clear()
                         dest_folder, target_label = self._resolve_target_folder_for_file(
-                            session["target_folder"], file_path, conversion_options, folder_cache
+                            session["target_folder"],
+                            file_path,
+                            conversion_options,
+                            folder_cache,
                         )
                         status, detail = self._process_single_email(
                             session["namespace"],
@@ -4450,7 +5159,9 @@ class EmlToPstConverter:
                                 skipped_messages.append(f"{current_file}: {detail}")
                         else:
                             errors += 1
-                            error_messages.append(f"{current_file}: {detail or 'Unknown error'}")
+                            error_messages.append(
+                                f"{current_file}: {detail or 'Unknown error'}"
+                            )
                         self._write_csv_row(
                             file_path, status, detail or "", duration, target_label
                         )
@@ -4548,7 +5259,11 @@ class EmlToPstConverter:
         if self._path_needs_native_staging(file_path):
             staged_already_tried = True
             staged_result = self._try_staged_eml_import_with_dates(
-                namespace, target_folder, file_path, conversion_options
+                namespace,
+                target_folder,
+                file_path,
+                conversion_options,
+                outlook=outlook,
             )
             if staged_result == "converted":
                 return "converted", ""
@@ -4594,7 +5309,7 @@ class EmlToPstConverter:
                 f"Reason: {native_result}; strict fallback failed: {strict_result}"
             )
 
-        if _is_outlook_rpc_error(native_result):
+        if _is_outlook_unavailable_error(native_result):
             logger.warning(
                 "Native import failed for %s (Outlook COM unavailable): %s",
                 log_sanitize(file_path),
@@ -4628,18 +5343,20 @@ class EmlToPstConverter:
         conversion_options,
         *,
         try_staged_first: bool = True,
+        from_validation_rebuild: bool = False,
     ):
         """
         Manual fallback import.
         Prefer staged OpenSharedItem (full MIME) with date stamping; if that fails,
         create the message in the PST folder via Items.Add (no Move from Drafts).
         """
-        if try_staged_first:
+        if try_staged_first and not from_validation_rebuild:
             staged_result = self._try_staged_eml_import_with_dates(
                 outlook.GetNamespace("MAPI"),
                 target_folder,
                 file_path,
                 conversion_options,
+                outlook=outlook,
             )
             if staged_result == "converted":
                 return "converted"
@@ -4687,14 +5404,6 @@ class EmlToPstConverter:
             if dt_local is not None:
                 self._stamp_delivery_on_new_item(mail, dt_local)
 
-            mail.Subject = str(email_data['subject'] or "(No Subject)")
-            if email_data.get('to'):
-                mail.To = str(email_data['to'])
-            if email_data.get('cc'):
-                mail.CC = str(email_data['cc'])
-
-            self._set_mail_body(mail, str(email_data.get('body') or ""))
-
             self._apply_original_metadata(
                 mail,
                 email_data,
@@ -4702,17 +5411,18 @@ class EmlToPstConverter:
                 apply_dates=False,
             )
 
+            self._apply_parsed_display_fields(
+                mail,
+                email_data,
+                file_path,
+                conversion_options,
+            )
+
             self._apply_attachment_chain(
                 mail,
                 email_data=email_data,
                 source_file_path=file_path,
             )
-
-            try:
-                if email_data.get('from'):
-                    mail.SentOnBehalfOfName = str(email_data['from'])
-            except (AttributeError, TypeError) as e:
-                logger.debug("Could not set sender: %s", e)
 
             namespace = outlook.GetNamespace("MAPI")
             sent_state = self._sent_state_for_source_path(file_path, conversion_options)
@@ -4743,7 +5453,16 @@ class EmlToPstConverter:
                     except Exception:
                         pass
                     return "Message was not saved in the target PST"
-            return "converted"
+            return self._ensure_import_quality(
+                mail,
+                file_path,
+                outlook,
+                target_folder,
+                conversion_options,
+                email_data=email_data,
+                from_validation_rebuild=from_validation_rebuild,
+                expected_folder=target_folder,
+            )
         except Exception as e:
             logger.debug("Manual fallback failed for %s: %s", file_path, e)
             return str(e)
@@ -5350,6 +6069,8 @@ class EmlToPstConverter:
         source_file_path: str | None,
         email_data: dict | None,
         conversion_options: dict,
+        *,
+        outlook=None,
     ):
         """
         Import OpenSharedItem mail into the target PST folder.
@@ -5373,6 +6094,12 @@ class EmlToPstConverter:
                 source_file_path=source_file_path,
                 apply_dates=False,
             )
+            self._apply_parsed_display_fields(
+                mail_item,
+                email_data,
+                source_file_path,
+                conversion_options,
+            )
 
         self._apply_attachment_chain(
             mail_item,
@@ -5392,6 +6119,19 @@ class EmlToPstConverter:
             pst_path=pst_path,
             dt_local=dt_local,
         )
+        if source_file_path and self._import_validation_enabled(conversion_options):
+            outlook = outlook or conversion_options.get("_session_outlook")
+            quality = self._ensure_import_quality(
+                mail_item,
+                source_file_path,
+                outlook,
+                target_folder,
+                conversion_options,
+                email_data=email_data,
+                expected_folder=target_folder,
+            )
+            if quality != "converted":
+                raise RuntimeError(quality)
         return mail_item
 
     def _finalize_message_datetime(
@@ -5524,6 +6264,8 @@ class EmlToPstConverter:
         target_folder,
         file_path: str,
         conversion_options: dict,
+        *,
+        outlook=None,
     ) -> str:
         """
         Import via staged CRLF .eml under LOCALAPPDATA + OpenSharedItem (+ optional .msg).
@@ -5543,14 +6285,25 @@ class EmlToPstConverter:
 
             mail_item = self._open_shared_item_from_staged_eml(namespace, staged_path)
             try:
-                self._transfer_opened_mail_to_folder(
+                saved = self._transfer_opened_mail_to_folder(
                     mail_item,
                     target_folder,
                     namespace,
                     file_path,
                     email_data,
                     conversion_options,
+                    outlook=outlook,
                 )
+                if self._export_targets_pst(conversion_options) and not self._verify_mail_in_target_pst(
+                    saved,
+                    conversion_options,
+                    source_file_path=file_path,
+                ):
+                    try:
+                        saved.Delete()
+                    except Exception:
+                        pass
+                    return "Message was not saved in the target PST"
                 return "converted"
             finally:
                 del mail_item
@@ -5821,6 +6574,7 @@ class EmlToPstConverter:
                     mtime_source_path,
                     email_data,
                     conversion_options,
+                    outlook=conversion_options.get("_session_outlook"),
                 )
             finally:
                 del mail_item

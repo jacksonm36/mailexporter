@@ -96,6 +96,31 @@ def main() -> int:
     if not _is_outlook_path_open_error("Invalid path or URL."):
         errors.append("_is_outlook_path_open_error invalid path")
 
+    fixed_name = EmlToPstConverter._decode_mime_header_field("PatÃ³cs")
+    if "ó" not in fixed_name:
+        errors.append(f"_decode_mime_header_field mojibake repair: got {fixed_name!r}")
+    if not hasattr(app_stub, "_apply_sender_from_parsed_from"):
+        errors.append("_apply_sender_from_parsed_from missing")
+    if not hasattr(app_stub, "_apply_parsed_display_fields"):
+        errors.append("_apply_parsed_display_fields missing")
+    if not hasattr(app_stub, "_ensure_import_quality"):
+        errors.append("_ensure_import_quality missing (mid-conversion validation)")
+    if not hasattr(app_stub, "_recover_outlook_session"):
+        errors.append("_recover_outlook_session missing")
+    if not hasattr(app_stub, "_mail_in_dest_folder"):
+        errors.append("_mail_in_dest_folder missing")
+    if not EmlToPstConverter._body_looks_like_html("<br/>Tisztelt Partnerünk!<br/><b>Hi</b>"):
+        errors.append("_body_looks_like_html should detect br/b fragments")
+    if EmlToPstConverter._body_looks_like_html("Plain text only."):
+        errors.append("_body_looks_like_html should reject plain text")
+    wrapped = EmlToPstConverter._normalize_html_body_for_outlook("<br/>Hi</br>")
+    if "<html" not in wrapped.lower() or "<body>" not in wrapped.lower():
+        errors.append("_normalize_html_body_for_outlook should wrap fragments")
+    if not EmlToPstConverter._outlook_text_is_blank("None"):
+        errors.append("_outlook_text_is_blank should treat literal None as blank")
+    if not hasattr(app_stub, "_clear_pst_session_caches"):
+        errors.append("_clear_pst_session_caches missing")
+
     wlm_like = r"C:\test\Account (user@domain)\Inbox\msg.eml"
     if not app_stub._path_needs_native_staging(wlm_like):
         errors.append("_path_needs_native_staging should be True for () and @ in path")
@@ -308,6 +333,52 @@ def main() -> int:
                 errors.append("_merge_attachment_records should merge distinct files")
             if not hasattr(app_stub, "_apply_attachment_chain"):
                 errors.append("_apply_attachment_chain missing")
+
+        html_only = os.path.join(mime_tmp, "html_inline_only.eml")
+        with open(html_only, "wb") as handle:
+            handle.write(
+                (
+                    "From: a@b.c\r\nTo: you@co.local\r\nSubject: HTML only\r\n"
+                    "MIME-Version: 1.0\r\n"
+                    'Content-Type: multipart/alternative; boundary="b"\r\n'
+                    "\r\n--b\r\n"
+                    "Content-Type: text/plain; charset=utf-8\r\n"
+                    "Content-Disposition: inline\r\n"
+                    "\r\nHello\r\n"
+                    "--b\r\n"
+                    "Content-Type: text/html; charset=utf-8\r\n"
+                    "Content-Disposition: inline\r\n"
+                    "\r\n<html><body>Hi</body></html>\r\n"
+                    "--b--\r\n"
+                ).encode("utf-8")
+            )
+        if app_stub._sniff_eml_has_attachments(html_only):
+            errors.append(
+                "_sniff_eml_has_attachments must ignore HTML inline-only multipart"
+            )
+        if not app_stub._sniff_eml_has_attachments(pdf_eml):
+            errors.append("_sniff_eml_has_attachments should detect PDF sample")
+
+        wlm_html = os.path.join(mime_tmp, "wlm_html_fragment.eml")
+        with open(wlm_html, "wb") as handle:
+            handle.write(
+                (
+                    "Reply-To: invoices@example.com\r\n"
+                    "Subject: =?utf-8?B?VMOpcsOpc3plbHQ=?=\r\n"
+                    "MIME-Version: 1.0\r\n"
+                    "Content-Type: text/html; charset=utf-8\r\n"
+                    "\r\n"
+                    "<br/>Tisztelt Partnerünk!<br/><b>196995</b>\r\n"
+                ).encode("utf-8")
+            )
+        wlm_parsed = app_stub.parse_eml(wlm_html)
+        if not wlm_parsed:
+            errors.append("parse_eml failed for WLM HTML fragment sample")
+        else:
+            if "invoices@example.com" not in (wlm_parsed.get("from") or ""):
+                errors.append("_resolve_from_header should use Reply-To when From missing")
+            if not EmlToPstConverter._body_looks_like_html(wlm_parsed.get("body") or ""):
+                errors.append("WLM HTML fragment body should look like HTML")
 
     wlm_opts = {"use_file_mtime_for_date": True}
     if not app_stub._is_windows_live_mail_path(
@@ -588,6 +659,111 @@ def main() -> int:
                 errors.append("export.log missing probe line")
             if "Mail Exporter export session" not in body:
                 errors.append("export.log missing session banner")
+
+    from mail_validation import (
+        ISSUE_BLANK_SENDER,
+        ISSUE_HTML_AS_PLAIN,
+        ISSUE_LITERAL_NONE_SENDER,
+        eml_parse_to_summary,
+        format_inspection_errors,
+        has_import_errors,
+        inspect_outlook_fields,
+        inspect_parsed_eml,
+        html_stored_as_plain_text,
+        load_converted_paths_from_csv,
+        outlook_text_is_blank,
+        parse_eml_summary,
+        validate_import_against_eml,
+    )
+
+    if not outlook_text_is_blank("None"):
+        errors.append("mail_validation.outlook_text_is_blank(None)")
+    bad = inspect_outlook_fields(
+        subject="None",
+        sender_name="None",
+        body="<br/>Hello<b>world</b>",
+        html_body="",
+    )
+    codes = {i.code for i in bad.issues}
+    if ISSUE_LITERAL_NONE_SENDER not in codes:
+        errors.append("inspect_outlook_fields should flag literal None sender")
+    if ISSUE_HTML_AS_PLAIN not in codes:
+        errors.append("inspect_outlook_fields should flag html_as_plain")
+    if not html_stored_as_plain_text("<br/>x", ""):
+        errors.append("html_stored_as_plain_text br fragment")
+    with tempfile.TemporaryDirectory() as vtmp:
+        ok_eml = os.path.join(vtmp, "ok.eml")
+        with open(ok_eml, "wb") as handle:
+            handle.write(
+                b"From: good@example.com\r\n"
+                b"Subject: Test\r\n"
+                b"Content-Type: text/plain\r\n\r\n"
+                b"Hello body\r\n"
+            )
+        summary = parse_eml_summary(ok_eml)
+        if not summary or inspect_parsed_eml(summary).issues:
+            errors.append("parse_eml_summary ok sample should have no issues")
+        csv_v = os.path.join(vtmp, "export_results.csv")
+        with open(csv_v, "w", newline="", encoding="utf-8") as handle:
+            w = __import__("csv").writer(handle)
+            w.writerow(
+                (
+                    "timestamp",
+                    "file_path",
+                    "status",
+                    "detail",
+                    "duration_sec",
+                    "target_folder",
+                )
+            )
+            w.writerow(
+                ("2026-01-01 00:00:00", ok_eml, "converted", "", "1.0", "Inbox")
+            )
+        if len(load_converted_paths_from_csv(csv_v)) != 1:
+            errors.append("load_converted_paths_from_csv")
+
+        bad_snap = {
+            "subject": "None",
+            "sender_name": "None",
+            "sender_email": "",
+            "body": "<br/>Hi</br>",
+            "html_body": "",
+            "attachment_count": 0,
+        }
+        bad_eml = eml_parse_to_summary(
+            {
+                "subject": "Invoice 123",
+                "from": "billing@example.com",
+                "body": "<br/>Hi</br>",
+                "attachments": [],
+            },
+            ok_eml,
+        )
+        vinsp = validate_import_against_eml(bad_snap, bad_eml, source=ok_eml)
+        if not has_import_errors(vinsp):
+            errors.append("validate_import_against_eml should flag None sender + html_as_plain")
+        if not format_inspection_errors(vinsp):
+            errors.append("format_inspection_errors empty")
+
+        from mail_validation import MailInspection
+
+        finsp = MailInspection()
+        append_folder_placement_issues(
+            finsp,
+            in_correct_folder=False,
+            actual_folder_path="Inbox\\Drafts",
+            expected_folder_path="Inbox\\Account (user@domain)",
+        )
+        if ISSUE_WRONG_FOLDER not in {i.code for i in finsp.issues}:
+            errors.append("append_folder_placement_issues wrong_folder")
+
+    try:
+        import export_checker as _ec
+
+        if not hasattr(_ec, "scan_pst"):
+            errors.append("export_checker.scan_pst missing")
+    except ImportError as exc:
+        errors.append(f"export_checker import: {exc}")
 
     if errors:
         print("FAILED:")
