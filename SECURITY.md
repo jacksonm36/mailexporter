@@ -20,4 +20,4 @@ This is a **local GUI** that reads user-chosen folders, writes a PST path the us
 
 ## Reporting
 
-If you find a security issue, report it privately to the repository maintainer.
+If you find a security issue, report it via GitHub Issues on this repository with minimal reproduction details (do not attach real mail or credentials).

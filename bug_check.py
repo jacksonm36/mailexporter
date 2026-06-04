@@ -96,7 +96,7 @@ def main() -> int:
     if not _is_outlook_path_open_error("Invalid path or URL."):
         errors.append("_is_outlook_path_open_error invalid path")
 
-    wlm_like = r"C:\test\PQ (user@domain)\Inbox\msg.eml"
+    wlm_like = r"C:\test\Account (user@domain)\Inbox\msg.eml"
     if not app_stub._path_needs_native_staging(wlm_like):
         errors.append("_path_needs_native_staging should be True for () and @ in path")
 
@@ -146,7 +146,7 @@ def main() -> int:
     if not hasattr(app_stub, "_import_eml_direct_to_pst_folder"):
         errors.append("_import_eml_direct_to_pst_folder missing")
 
-    pst_opts = {"pst_option": "new", "destination_path": r"C:\out\pq2.pst"}
+    pst_opts = {"pst_option": "new", "destination_path": r"C:\out\export.pst"}
     mbox_opts = {"pst_option": "mailbox", "destination_path": ""}
     if not app_stub._export_targets_pst(pst_opts):
         errors.append("_export_targets_pst should be True for PST export")
@@ -157,10 +157,10 @@ def main() -> int:
         def __init__(self, store_path: str):
             self.Parent = type("P", (), {"Store": type("S", (), {"FilePath": store_path})()})()
 
-    if app_stub._message_in_expected_pst(_FakeMail(""), r"C:\out\pq1.pst"):
+    if app_stub._message_in_expected_pst(_FakeMail(""), r"C:\out\other.pst"):
         errors.append("_message_in_expected_pst must reject empty store path")
     if not app_stub._message_in_expected_pst(
-        _FakeMail(r"C:\out\pq1.pst"), r"C:\out\pq1.pst"
+        _FakeMail(r"C:\out\other.pst"), r"C:\out\other.pst"
     ):
         errors.append("_message_in_expected_pst should accept matching PST path")
 
@@ -169,11 +169,11 @@ def main() -> int:
             self.Name = name
             self.Store = type("S", (), {"FilePath": store_path})()
 
-    bad = _FakeFolder("", r"C:\out\pq1.pst")
-    if app_stub._folder_is_usable_import_target(bad, r"C:\out\pq1.pst"):
+    bad = _FakeFolder("", r"C:\out\other.pst")
+    if app_stub._folder_is_usable_import_target(bad, r"C:\out\other.pst"):
         errors.append("_folder_is_usable_import_target must reject empty folder name")
-    good = _FakeFolder("Inbox", r"C:\out\pq1.pst")
-    if not app_stub._folder_is_usable_import_target(good, r"C:\out\pq1.pst"):
+    good = _FakeFolder("Inbox", r"C:\out\other.pst")
+    if not app_stub._folder_is_usable_import_target(good, r"C:\out\other.pst"):
         errors.append("_folder_is_usable_import_target should accept named Inbox")
 
     class _FakeStore:
@@ -192,7 +192,7 @@ def main() -> int:
             self.Store = store
             self.Items = _FakeItems()
 
-    pst_store = _FakeStore(r"C:\out\pq2.pst")
+    pst_store = _FakeStore(r"C:\out\export.pst")
     unnamed_inbox = _FakeInboxNoName(pst_store)
     if not app_stub._stores_match(unnamed_inbox.Store, pst_store):
         errors.append("_stores_match should match same StoreID/path")
@@ -316,7 +316,7 @@ def main() -> int:
         errors.append("_is_windows_live_mail_path")
     with tempfile.TemporaryDirectory() as wlm_tmp:
         wlm_eml = os.path.join(
-            wlm_tmp, "Windows Live Mail", "PQ (user@x)", "Inbox", "probe.eml"
+            wlm_tmp, "Windows Live Mail", "Account (user@domain)", "Inbox", "probe.eml"
         )
         os.makedirs(os.path.dirname(wlm_eml), exist_ok=True)
         with open(wlm_eml, "wb") as handle:
@@ -407,34 +407,34 @@ def main() -> int:
     if standard_outlook_folder_id("Outbox") != OL_FOLDER_OUTBOX:
         errors.append("standard_outlook_folder_id Outbox")
 
-    if sent_state_for_folder_parts(["PQ (x)", "Sent Items"]) is not True:
+    if sent_state_for_folder_parts(["Account (x)", "Sent Items"]) is not True:
         errors.append("sent_state_for_folder_parts Sent Items")
-    if sent_state_for_folder_parts(["PQ", "Drafts"]) is not False:
+    if sent_state_for_folder_parts(["Account", "Drafts"]) is not False:
         errors.append("sent_state_for_folder_parts Drafts")
-    if sent_state_for_folder_parts(["PQ", "Outbox"]) is not False:
+    if sent_state_for_folder_parts(["Account", "Outbox"]) is not False:
         errors.append("sent_state_for_folder_parts Outbox")
-    if sent_state_for_folder_parts(["PQ", "Inbox"]) is not None:
+    if sent_state_for_folder_parts(["Account", "Inbox"]) is not None:
         errors.append("sent_state_for_folder_parts Inbox should be None")
-    if sent_state_for_folder_parts(["PQ", "Deleted Items"]) is not None:
+    if sent_state_for_folder_parts(["Account", "Deleted Items"]) is not None:
         errors.append("sent_state_for_folder_parts Deleted Items should be None")
 
     fid, idx, rem = find_standard_folder_in_parts(
-        ["PQ (user@x)", "Sent Items", "2024"]
+        ["Account (user@domain)", "Sent Items", "2024"]
     )
-    if fid != OL_FOLDER_SENT or idx != 1 or rem != ["PQ (user@x)", "2024"]:
+    if fid != OL_FOLDER_SENT or idx != 1 or rem != ["Account (user@domain)", "2024"]:
         errors.append(f"nested standard folder map: fid={fid} idx={idx} rem={rem}")
-    fid2, idx2, rem2 = find_standard_folder_in_parts(["PQ", "Outbox"])
-    if fid2 != OL_FOLDER_OUTBOX or idx2 != 1 or rem2 != ["PQ"]:
+    fid2, idx2, rem2 = find_standard_folder_in_parts(["Account", "Outbox"])
+    if fid2 != OL_FOLDER_OUTBOX or idx2 != 1 or rem2 != ["Account"]:
         errors.append(f"outbox folder map: fid={fid2} idx={idx2} rem={rem2}")
     fid3, idx3, rem3 = find_standard_folder_in_parts(
-        ["PQ", "Inbox", "Projects", "Inbox"]
+        ["Account", "Inbox", "Projects", "Inbox"]
     )
-    if fid3 != OL_FOLDER_INBOX or idx3 != 3 or rem3 != ["PQ", "Inbox", "Projects"]:
+    if fid3 != OL_FOLDER_INBOX or idx3 != 3 or rem3 != ["Account", "Inbox", "Projects"]:
         errors.append(
             f"last standard folder wins: fid={fid3} idx={idx3} rem={rem3}"
         )
-    fid4, _, rem4 = find_standard_folder_in_parts(["PQ", "Deleted Items"])
-    if fid4 != OL_FOLDER_DELETED or rem4 != ["PQ"]:
+    fid4, _, rem4 = find_standard_folder_in_parts(["Account", "Deleted Items"])
+    if fid4 != OL_FOLDER_DELETED or rem4 != ["Account"]:
         errors.append(f"deleted folder map: fid={fid4} rem={rem4}")
 
     if not hasattr(app_stub, "_get_or_create_pst_standard_folder"):
@@ -448,7 +448,7 @@ def main() -> int:
         parts = relative_folder_parts(root, sample)
         if parts != ["Inbox"]:
             errors.append(f"relative_folder_parts expected ['Inbox'], got {parts}")
-    wlm_root = os.path.join(root, "PQ (user@x)") if os.path.isdir(os.path.join(root, "PQ (user@x)")) else ""
+    wlm_root = os.path.join(root, "Account (user@domain)") if os.path.isdir(os.path.join(root, "Account (user@domain)")) else ""
     if not wlm_root:
         wlm_root = root
     nested = os.path.join(wlm_root, "Inbox", "tiny_0001_test.eml")

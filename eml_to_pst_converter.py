@@ -2461,7 +2461,7 @@ class EmlToPstConverter:
 
         Standard WLM/Outlook folder names in the source path always map to the
         corresponding PST folder. Optional preserve_subfolders only controls
-        whether account/custom segments (e.g. PQ (user@x)) are recreated under
+        whether account/custom segments (e.g. Account (user@domain)) are recreated under
         that folder.
         """
         source_root = conversion_options.get("source_root", "")
@@ -3267,7 +3267,7 @@ class EmlToPstConverter:
             return -1
 
     def _nested_account_folder_count(self, parent_folder) -> tuple[str, int] | None:
-        """First subfolder under a standard folder (usually PQ (user@…))."""
+        """First subfolder under a standard folder (usually Account (user@…))."""
         try:
             subfolders = parent_folder.Folders
             count = int(subfolders.Count)
@@ -3336,7 +3336,7 @@ class EmlToPstConverter:
             )
         logger.info(
             "In Outlook: expand %s → Inbox / Beérkezett üzenetek → account folder "
-            "(e.g. PQ (pqinfo@ 252)) for imported Inbox .eml; same account folder "
+            "(e.g. Account (user@domain)) for imported Inbox .eml; same account folder "
             "under Deleted Items / Elküldött for other WLM folders. "
             "Uncheck 'preserve account subfolders' for a flat Inbox only.",
             pst_label,
@@ -3672,7 +3672,7 @@ class EmlToPstConverter:
         return None
 
     def _label_pst_store_for_outlook(self, store, pst_path: str) -> None:
-        """Show basename (e.g. pq2) in Outlook navigation instead of generic label."""
+        """Show PST basename (e.g. export) in Outlook navigation instead of generic label."""
         pst_path = normalize_pst_path(pst_path)
         label = os.path.splitext(os.path.basename(pst_path))[0] or "MailExporter PST"
         try:
@@ -3756,7 +3756,7 @@ class EmlToPstConverter:
             raise RuntimeError(
                 f"Could not access a writable Inbox on PST {pst_path}. "
                 "Close Outlook, remove the PST from the profile, and try again — "
-                "or delete pq2.pst and export to a new file."
+                "or delete the export PST and export to a new file."
             )
         name = str(getattr(inbox, "Name", "") or "").strip() or "Inbox"
         logger.info("PST import Inbox ready: %r (%s)", name, pst_path)
@@ -4533,7 +4533,7 @@ class EmlToPstConverter:
                     detail = f"Duplicate content (Date: {header_date})"
                 return "skipped", detail
 
-        # PST: never OpenSharedItem (opens profile Drafts; Copy into pq*.pst fails silently).
+        # PST: never OpenSharedItem (opens profile Drafts; Copy into target PST fails silently).
         if self._export_targets_pst(conversion_options):
             pst_result = self._import_eml_direct_to_pst_folder(
                 file_path, target_folder, outlook, conversion_options
@@ -5143,7 +5143,7 @@ class EmlToPstConverter:
         Move OpenSharedItem mail into the export PST before Save.
 
         OpenSharedItem opens in the profile Drafts store (often with an empty
-        Store.FilePath). Saving there leaves mail outside pq1.pst; Copy first.
+        Store.FilePath). Saving there leaves mail outside the export PST; Copy first.
         """
         dest_folder = self._coerce_import_folder(dest_folder, conversion_options)
         pst_path = conversion_options.get("destination_path") or ""
