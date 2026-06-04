@@ -27,7 +27,6 @@ class PathValidator:
         r"\$[A-Za-z0-9_]+",  # Environment variables
         r"[;|&`$<>]",  # Command injection chars
         r"\\\\[^\\]+\\[^\\]+",  # UNC paths (\\server\share)
-        r"\\0",  # Null byte injection
     ]
 
     # Allowed extensions
@@ -86,6 +85,8 @@ class PathValidator:
         if not user_input:
             raise PathSecurityError("Missing path")
 
+        if "\0" in user_input:
+            raise PathSecurityError("Null byte in path")
         user_input = user_input.replace("\0", "")
         cls._check_dangerous_patterns(user_input)
 

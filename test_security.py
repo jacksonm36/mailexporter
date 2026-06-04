@@ -51,14 +51,8 @@ class TestPathSecurity(unittest.TestCase):
     def test_null_byte_injection(self):
         """Test null byte injection protection"""
         attack = "test\0.exe"
-        result = self.validator.sanitize_path(attack, self.temp_dir)
-        self.assertNotIn("\0", result)
-        self.assertTrue(result.endswith(".exe"))
-        self.assertTrue(
-            self.validator._path_within_base(
-                os.path.realpath(self.temp_dir), result
-            )
-        )
+        with self.assertRaises(PathSecurityError):
+            self.validator.sanitize_path(attack, self.temp_dir)
 
     def test_extension_validation(self):
         """Test file extension validation"""
@@ -123,6 +117,17 @@ class TestPathSecurity(unittest.TestCase):
         """Absolute paths are allowed when still under base_dir"""
         result = self.validator.sanitize_path(self.test_file, self.temp_dir)
         self.assertTrue(os.path.samefile(result, self.test_file))
+
+    def test_windows_live_mail_hex_folder_names(self):
+        """WLM paths like \\00014461-... must not match a false null-byte pattern."""
+        wlm_dir = os.path.join(self.temp_dir, "00014461-000078FC")
+        os.makedirs(wlm_dir, exist_ok=True)
+        eml = os.path.join(wlm_dir, "00014461-000078FC.eml")
+        with open(eml, "w", encoding="utf-8") as handle:
+            handle.write("From: a@b.com\n\nbody\n")
+        rel = os.path.join("00014461-000078FC", "00014461-000078FC.eml")
+        result = self.validator.sanitize_path(rel, self.temp_dir)
+        self.assertTrue(os.path.samefile(result, eml))
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)

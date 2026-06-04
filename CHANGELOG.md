@@ -23,6 +23,10 @@
 - **Parallel prep** (`parallel_processor.py`, `EML2PST_PARALLEL_WORKERS`): thread pool prefetches dedup fingerprints while COM import runs on the main thread. Do not parallelize Outlook COM (unstable).
 - **Async prep** (`async_processor.py`, `EML2PST_ASYNC_IO=1`): asyncio scheduler for prep; optional `aiofiles`.
 - **COM pipeline** (`com_pipeline.py`, `EML2PST_COM_PIPELINE=1` or `EML2PST_COM_WORKERS=1`): one dedicated Outlook STA worker thread. `EML2PST_COM_WORKERS>1` is not supported for a single PST.
+
+### Fixed
+- **SQLite + COM pipeline:** thread-safe dedup DB (`check_same_thread=False` + lock) when prep/import run on worker threads.
+- **Path security:** WLM folders like `\00014461-...` no longer rejected as false `\\0` null-byte matches.
 - **Memory-mapped I/O** for large `.eml` files (`mmap_processor.py`, default from 4 MB via `EML2PST_MMAP_THRESHOLD_MB`): parsing, SHA-256 dedup, fingerprint head/tail, and streamed CRLF staging without loading the full file into RAM.
 - SQLite dedup for large mailboxes (default from 200k files).
 - File sizes cached at scan time (avoids repeated `stat()` during export).

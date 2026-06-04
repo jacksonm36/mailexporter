@@ -1050,6 +1050,7 @@ class EmlToPstConverter:
         self._dedup_sqlite_conn = None
         self._dedup_sqlite_path = None
         self._dedup_sqlite_pending = 0
+        self._dedup_sqlite_lock = threading.Lock()
         self._eml_file_sizes: dict[str, int] = {}
         # Native OpenSharedItem staging: paths kept until batch finishes (Outlook async read).
         self._native_staging_paths = []
@@ -2872,25 +2873,26 @@ class EmlToPstConverter:
             return
         norm = os.path.normpath(os.path.abspath(file_path))
         st = (status or "").lower().strip()
-        try:
-            conn.execute(
-                """
-                INSERT INTO converted_path(path, status, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(path) DO UPDATE SET
-                    status = excluded.status,
-                    updated_at = excluded.updated_at
-                """,
-                (norm, st, datetime.now().isoformat(timespec="seconds")),
-            )
-            if st == "converted":
-                self._dedup_sqlite_pending += 1
-                if self._dedup_sqlite_pending >= DEDUP_SQLITE_COMMIT_EVERY:
-                    conn.commit()
-                    conn.execute("BEGIN")
-                    self._dedup_sqlite_pending = 0
-        except sqlite3.Error as e:
-            logger.debug("SQLite converted_path update failed: %s", e)
+        with self._dedup_sqlite_lock:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO converted_path(path, status, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(path) DO UPDATE SET
+                        status = excluded.status,
+                        updated_at = excluded.updated_at
+                    """,
+                    (norm, st, datetime.now().isoformat(timespec="seconds")),
+                )
+                if st == "converted":
+                    self._dedup_sqlite_pending += 1
+                    if self._dedup_sqlite_pending >= DEDUP_SQLITE_COMMIT_EVERY:
+                        conn.commit()
+                        conn.execute("BEGIN")
+                        self._dedup_sqlite_pending = 0
+            except sqlite3.Error as e:
+                logger.debug("SQLite converted_path update failed: %s", e)
 
     def _resolve_target_folder_for_file(
         self,
@@ -3312,7 +3314,7 @@ class EmlToPstConverter:
                         os.remove(p)
                 except OSError as e:
                     logger.debug("Could not remove old dedup db %s: %s", p, e)
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA temp_store=MEMORY")
@@ -3371,21 +3373,21 @@ class EmlToPstConverter:
             )
 
     def _close_dedup_backend(self, conversion_options: dict | None = None) -> None:
-        conn = self._dedup_sqlite_conn
-        db_path = self._dedup_sqlite_path
-        self._dedup_sqlite_conn = None
-        self._dedup_sqlite_path = None
-        self._dedup_sqlite_pending = 0
-        if conn is None:
-            return
-        try:
-            conn.commit()
-        except sqlite3.Error:
-            pass
-        try:
-            conn.close()
-        except sqlite3.Error:
-            pass
+        with self._dedup_sqlite_lock:
+            conn = self._dedup_sqlite_conn
+            self._dedup_sqlite_conn = None
+            self._dedup_sqlite_path = None
+            self._dedup_sqlite_pending = 0
+            if conn is None:
+                return
+            try:
+                conn.commit()
+            except sqlite3.Error:
+                pass
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
         # Keep dedup_state.sqlite3 beside export_results.csv for resume runs.
 
     def _dedup_key_for_file(self, file_path: str, size: int) -> tuple[str, str] | None:
@@ -3422,24 +3424,25 @@ class EmlToPstConverter:
             conn = self._dedup_sqlite_conn
             if conn is None:
                 raise RuntimeError("SQLite dedup backend not initialized")
-            changes_before = conn.total_changes
-            conn.execute(
-                "INSERT OR IGNORE INTO seen(hash, header_date) VALUES (?, ?)",
-                (key, header_date or None),
-            )
-            inserted = (conn.total_changes - changes_before) > 0
-            if inserted:
-                self._dedup_sqlite_pending += 1
-                if self._dedup_sqlite_pending >= DEDUP_SQLITE_COMMIT_EVERY:
-                    conn.commit()
-                    conn.execute("BEGIN")
-                    self._dedup_sqlite_pending = 0
-            elif header_date:
-                logger.debug(
-                    "Duplicate skipped (hash match, header Date was %s)",
-                    header_date,
+            with self._dedup_sqlite_lock:
+                changes_before = conn.total_changes
+                conn.execute(
+                    "INSERT OR IGNORE INTO seen(hash, header_date) VALUES (?, ?)",
+                    (key, header_date or None),
                 )
-            return not inserted
+                inserted = (conn.total_changes - changes_before) > 0
+                if inserted:
+                    self._dedup_sqlite_pending += 1
+                    if self._dedup_sqlite_pending >= DEDUP_SQLITE_COMMIT_EVERY:
+                        conn.commit()
+                        conn.execute("BEGIN")
+                        self._dedup_sqlite_pending = 0
+                elif header_date:
+                    logger.debug(
+                        "Duplicate skipped (hash match, header Date was %s)",
+                        header_date,
+                    )
+                return not inserted
         with self._lock:
             if FULL_DEDUP_HASH:
                 if key in self.processed_hashes:
