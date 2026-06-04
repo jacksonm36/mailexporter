@@ -1,2 +1,4 @@
 pywin32>=306
 pyinstaller>=6.0
+# Optional for EML2PST_ASYNC_IO=1: pip install aiofiles
+aiofiles>=23.0

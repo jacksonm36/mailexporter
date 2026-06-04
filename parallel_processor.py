@@ -211,3 +211,104 @@ class EmlPrepPrefetcher:
         except TypeError:
             self._executor.shutdown(wait=not cancel_pending)
         self._executor = None
+
+
+class AsyncEmlPrepPrefetcher(EmlPrepPrefetcher):
+    """
+    Same prefetch API as EmlPrepPrefetcher but schedules prep on a background asyncio loop.
+    Enable with EML2PST_ASYNC_IO=1 (optional aiofiles for header reads in converter).
+    """
+
+    def __init__(
+        self,
+        prep_func: Callable[[str], EmlPrepResult],
+        *,
+        max_workers: int,
+        max_in_flight: int | None = None,
+    ):
+        self._prep_func = prep_func
+        self._max_workers = max(1, max_workers)
+        self._max_in_flight = max_in_flight or self._max_workers * 4
+        self._runner: Any = None
+        self._paths_queue: list[str] = []
+        self._queue_idx = 0
+        self._scheduled: set[str] = set()
+        self._lock = threading.Lock()
+
+    def start(self, file_paths: list[str]) -> None:
+        from async_processor import AsyncPrepLoopRunner
+
+        self._paths_queue = list(file_paths)
+        self._queue_idx = 0
+        self._scheduled = set()
+        self._runner = AsyncPrepLoopRunner(
+            self._prep_func, concurrency=self._max_in_flight
+        )
+        self._runner.start()
+        self._schedule_ahead()
+
+    def _schedule_ahead(self) -> None:
+        if not self._runner:
+            return
+        with self._lock:
+            while (
+                self._queue_idx < len(self._paths_queue)
+                and len(self._scheduled) < self._max_in_flight
+            ):
+                path = self._paths_queue[self._queue_idx]
+                self._queue_idx += 1
+                norm = os.path.normpath(os.path.abspath(path))
+                if norm in self._scheduled:
+                    continue
+                self._scheduled.add(norm)
+                self._runner.submit(path)
+
+    def take(self, norm_path: str, *, timeout: float | None = 120.0) -> EmlPrepResult | None:
+        self._schedule_ahead()
+        if not self._runner:
+            return None
+        result = self._runner.take(norm_path, timeout=timeout or 120.0)
+        with self._lock:
+            self._scheduled.discard(norm_path)
+        self._schedule_ahead()
+        if result is None:
+            return EmlPrepResult(
+                file_path=norm_path,
+                norm_path=norm_path,
+                size=0,
+                prep_error="Prep timeout",
+            )
+        if isinstance(result, EmlPrepResult):
+            return result
+        if isinstance(result, BaseException):
+            return EmlPrepResult(
+                file_path=norm_path,
+                norm_path=norm_path,
+                size=0,
+                prep_error=str(result),
+            )
+        return result
+
+    def shutdown(self, *, cancel_pending: bool = False) -> None:
+        if self._runner:
+            self._runner.shutdown()
+        self._runner = None
+
+
+def create_eml_prep_prefetcher(
+    prep_func: Callable[[str], EmlPrepResult],
+    *,
+    max_workers: int,
+) -> EmlPrepPrefetcher:
+    """Thread-pool prefetcher, or asyncio-backed when EML2PST_ASYNC_IO=1."""
+    try:
+        from async_processor import ASYNC_IO_ENABLED
+    except ImportError:
+        ASYNC_IO_ENABLED = False
+    if ASYNC_IO_ENABLED and max_workers > 0:
+        logger.info(
+            "Async I/O prep enabled (concurrency ~%d; install aiofiles for async reads)",
+            max_workers * 4,
+        )
+        return AsyncEmlPrepPrefetcher(prep_func, max_workers=max_workers)
+    return EmlPrepPrefetcher(prep_func, max_workers=max_workers)

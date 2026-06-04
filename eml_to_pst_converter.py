@@ -31,6 +31,10 @@ from pathlib import Path
 from email.header import decode_header
 from email.utils import parseaddr, parsedate_to_datetime
 
+from env_config import load_mail_exporter_env
+
+_ENV_FILE_LOADED = load_mail_exporter_env(log=False)
+
 from i18n import (
     LANG_EN,
     LANG_HU,
@@ -49,8 +53,13 @@ from recovery_manager import RecoveryManager
 from smart_dedup import dedup_key_from_header_sample, normalize_strategy
 from parallel_processor import (
     PARALLEL_PREP_WORKERS,
-    EmlPrepPrefetcher,
+    create_eml_prep_prefetcher,
     EmlPrepResult,
+)
+from com_pipeline import (
+    ComImportPipeline,
+    ImportResult,
+    com_pipeline_should_run,
 )
 from mmap_processor import (
     MMAP_READ_THRESHOLD,
@@ -124,6 +133,10 @@ if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
 logger = logging.getLogger("MailExporter")
 logger.setLevel(logging.INFO)
+if _ENV_FILE_LOADED:
+    logger.info("Loaded settings from %s", _ENV_FILE_LOADED)
+elif os.environ.get("EML2PST_PARALLEL_WORKERS") or os.environ.get("EML2PST_COM_PIPELINE"):
+    logger.info("Using embedded or system EML2PST_* environment settings")
 
 
 class _ImmediateFileHandler(logging.Handler):
@@ -364,6 +377,11 @@ PARALLEL_PARSE = os.environ.get("EML2PST_PARALLEL_PARSE", "").strip().lower() in
     "true",
     "yes",
 )
+USE_COM_PIPELINE = com_pipeline_should_run()
+try:
+    from async_processor import ASYNC_IO_ENABLED
+except ImportError:
+    ASYNC_IO_ENABLED = False
 DEDUP_STRATEGY = normalize_strategy(os.environ.get("EML2PST_DEDUP_STRATEGY", "content_hash"))
 CHECKPOINT_EVERY = _env_int("EML2PST_CHECKPOINT_EVERY", 0, lo=0, hi=50_000)
 
@@ -3014,6 +3032,8 @@ class EmlToPstConverter:
             "validate_import": VALIDATE_IMPORT,
             "parallel_workers": PARALLEL_PREP_WORKERS,
             "parallel_parse": PARALLEL_PARSE,
+            "use_com_pipeline": USE_COM_PIPELINE,
+            "async_io": ASYNC_IO_ENABLED,
         }
 
         if conversion_options["pst_option"] == "mailbox":
@@ -3496,30 +3516,35 @@ class EmlToPstConverter:
         outlook = None
         namespace = None
         prev_display_alerts = None
+        total = len(files_to_process)
+        skip_main_outlook = (
+            export_mode != "mailbox"
+            and USE_COM_PIPELINE
+            and not self._should_use_pst_chunks(conversion_options, total)
+        )
         try:
-            try:
-                outlook = WIN32COM.Dispatch("Outlook.Application")
-            except Exception as e:
-                raise RuntimeError(f"Could not connect to Outlook: {e}") from e
+            if not skip_main_outlook:
+                try:
+                    outlook = WIN32COM.Dispatch("Outlook.Application")
+                except Exception as e:
+                    raise RuntimeError(f"Could not connect to Outlook: {e}") from e
 
-            try:
-                prev_display_alerts = outlook.DisplayAlerts
-                outlook.DisplayAlerts = False
-            except Exception:
-                prev_display_alerts = None
+                try:
+                    prev_display_alerts = outlook.DisplayAlerts
+                    outlook.DisplayAlerts = False
+                except Exception:
+                    prev_display_alerts = None
 
-            try:
-                namespace = outlook.GetNamespace("MAPI")
-            except Exception as e:
-                raise RuntimeError(f"Could not access MAPI namespace: {e}") from e
+                try:
+                    namespace = outlook.GetNamespace("MAPI")
+                except Exception as e:
+                    raise RuntimeError(f"Could not access MAPI namespace: {e}") from e
 
-            conversion_options["_session_outlook"] = outlook
+                conversion_options["_session_outlook"] = outlook
 
             if export_mode != "mailbox":
                 pst_path = normalize_pst_path(pst_path)
                 conversion_options["destination_path"] = pst_path
-
-            total = len(files_to_process)
             folder_cache: dict = {}
             if export_mode == "mailbox":
                 store_label = conversion_options.get("mailbox_store_label", "")
@@ -3564,6 +3589,24 @@ class EmlToPstConverter:
                     conversion_options,
                     lang,
                     pst_path,
+                )
+            elif USE_COM_PIPELINE:
+                pst_path = normalize_pst_path(pst_path)
+                conversion_options["destination_path"] = pst_path
+                note = t(lang, "note_pst_saved", path=pst_path)
+                logger.info(
+                    "COM pipeline: dedicated Outlook STA worker (not parallel COM to one PST)"
+                )
+                converted, skipped, errors, error_messages, skipped_messages, cancelled = (
+                    self._process_email_files(
+                        None,
+                        None,
+                        None,
+                        files_to_process,
+                        total,
+                        conversion_options,
+                        folder_cache,
+                    )
                 )
             else:
                 self._update_status(t(lang, "status_creating_pst"))
@@ -5252,6 +5295,259 @@ class EmlToPstConverter:
             email_data=email_data,
         )
 
+    def _com_pipeline_worker_start(self, conversion_options: dict, folder_cache: dict) -> dict:
+        """Initialize Outlook COM on the pipeline worker thread (STA)."""
+        import pythoncom
+
+        pythoncom.CoInitialize()
+        ctx: dict = {"com_initialized": True, "folder_cache": folder_cache}
+        try:
+            outlook = self._dispatch_outlook_application()
+            try:
+                outlook.DisplayAlerts = False
+            except Exception:
+                pass
+            namespace = outlook.GetNamespace("MAPI")
+            export_mode = conversion_options.get("pst_option", "new")
+            if export_mode != "mailbox":
+                pst_path = normalize_pst_path(
+                    conversion_options.get("destination_path", "")
+                )
+                pst_path = self._ensure_pst_store_attached(
+                    outlook, namespace, pst_path, conversion_options
+                )
+                conversion_options["destination_path"] = pst_path
+                pst_store = self._find_pst_store(namespace, pst_path)
+                if pst_store:
+                    self._log_attached_pst_store(pst_store, pst_path)
+            target_folder = self._resolve_export_target_folder(namespace, conversion_options)
+            conversion_options["_session_outlook"] = outlook
+            ctx["session"] = {
+                "outlook": outlook,
+                "namespace": namespace,
+                "target_folder": target_folder,
+            }
+            return ctx
+        except Exception:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+            raise
+
+    def _com_pipeline_worker_stop(self, ctx: dict | None) -> None:
+        if not ctx or not ctx.get("com_initialized"):
+            return
+        import pythoncom
+
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+    def _com_pipeline_import_one(
+        self,
+        ctx: dict,
+        file_path: str,
+        prep: EmlPrepResult | None,
+        conversion_options: dict,
+    ) -> ImportResult:
+        """Run one import on the COM worker thread."""
+        session = ctx["session"]
+        folder_cache = ctx["folder_cache"]
+        lang = conversion_options.get("lang", LANG_EN)
+        conversion_options["_prep_result"] = prep
+        conversion_options["_parsed_email_data"] = prep.email_data if prep else None
+        consecutive_rpc_failures = 0
+        try:
+            if not self._probe_outlook_application(
+                session["outlook"], conversion_options
+            ):
+                self._refresh_outlook_session_after_failure(
+                    session,
+                    conversion_options,
+                    folder_cache,
+                    lang=lang,
+                    consecutive_failures=1,
+                )
+            dest_folder, target_label = self._resolve_target_folder_for_file(
+                session["target_folder"], file_path, conversion_options, folder_cache
+            )
+            status, detail = self._process_single_email(
+                session["namespace"],
+                dest_folder,
+                file_path,
+                session["outlook"],
+                conversion_options,
+            )
+            if status == "error" and _is_outlook_unavailable_error(detail):
+                consecutive_rpc_failures += 1
+                self._refresh_outlook_session_after_failure(
+                    session,
+                    conversion_options,
+                    folder_cache,
+                    lang=lang,
+                    consecutive_failures=consecutive_rpc_failures,
+                )
+                dest_folder, target_label = self._resolve_target_folder_for_file(
+                    session["target_folder"], file_path, conversion_options, folder_cache
+                )
+                status, detail = self._process_single_email(
+                    session["namespace"],
+                    dest_folder,
+                    file_path,
+                    session["outlook"],
+                    conversion_options,
+                )
+            return ImportResult(
+                path=file_path,
+                success=status != "error",
+                status=status,
+                detail=detail or "",
+                target_label=target_label,
+            )
+        except Exception as exc:
+            return ImportResult(
+                path=file_path,
+                success=False,
+                status="error",
+                detail=str(exc),
+                exception=exc,
+            )
+        finally:
+            conversion_options.pop("_prep_result", None)
+            conversion_options.pop("_parsed_email_data", None)
+
+    def _process_email_files_com_pipeline(
+        self,
+        files_to_process,
+        total,
+        conversion_options,
+        folder_cache,
+        *,
+        progress_offset: int = 0,
+        progress_total: int | None = None,
+    ):
+        """Prep on this thread; Outlook import on a single dedicated COM worker."""
+        if progress_total is None:
+            progress_total = total
+        converted = skipped = errors = 0
+        error_messages: list[str] = []
+        skipped_messages: list[str] = []
+        cancelled = False
+        lang = conversion_options.get("lang", LANG_EN)
+        rate_limiter = conversion_options.get("_rate_limiter")
+        recovery = conversion_options.get("_recovery")
+        conversion_options.setdefault("_export_started_mono", time.monotonic())
+        last_conv_ui = [0.0]
+        parallel_workers = int(conversion_options.get("parallel_workers") or 0)
+        prefetcher = None
+        worker_ctx: dict = {}
+
+        def _import_one(path: str, prep):
+            return self._com_pipeline_import_one(
+                worker_ctx, path, prep, conversion_options
+            )
+
+        def _on_worker_start():
+            nonlocal worker_ctx
+            worker_ctx = self._com_pipeline_worker_start(conversion_options, folder_cache)
+            return worker_ctx
+
+        pipeline = ComImportPipeline(
+            import_one=_import_one,
+            on_worker_start=_on_worker_start,
+            on_worker_stop=self._com_pipeline_worker_stop,
+        )
+        pipeline.start()
+        if pipeline.worker_error:
+            raise RuntimeError(f"COM pipeline failed to start: {pipeline.worker_error}")
+
+        if parallel_workers > 0:
+            prefetcher = create_eml_prep_prefetcher(
+                lambda p, opts=conversion_options: self._prep_eml_without_com(p, opts),
+                max_workers=parallel_workers,
+            )
+            prefetcher.start(files_to_process)
+
+        try:
+            for i, file_path in enumerate(files_to_process):
+                if self._is_cancelled():
+                    cancelled = True
+                    break
+                norm_path = os.path.normpath(os.path.abspath(file_path))
+                prep_result = None
+                if prefetcher is not None:
+                    prep_result = prefetcher.take(norm_path)
+                pipeline.submit(file_path, prep_result)
+                result = pipeline.get_result(timeout=600.0)
+                if result is None:
+                    errors += 1
+                    error_messages.append(f"{os.path.basename(file_path)}: COM pipeline timeout")
+                    continue
+                current_file = os.path.basename(file_path)
+                started = time.perf_counter()
+                status = result.status or "error"
+                detail = result.detail or ""
+                target_label = result.target_label or ""
+                if result.exception:
+                    status = "error"
+                    detail = str(result.exception)
+
+                duration = time.perf_counter() - started
+                if status == "converted":
+                    converted += 1
+                    if rate_limiter:
+                        rate_limiter.record_success()
+                elif status == "skipped":
+                    skipped += 1
+                    if detail:
+                        skipped_messages.append(f"{current_file}: {detail}")
+                else:
+                    errors += 1
+                    error_messages.append(f"{current_file}: {detail or 'Unknown error'}")
+                    if rate_limiter:
+                        rate_limiter.record_failure()
+                self._write_csv_row(file_path, status, detail or "", duration, target_label)
+                done = i + 1
+                if done == 1 or done % CONVERSION_UI_EVERY == 0 or done == total:
+                    overall_done = progress_offset + done
+                    now = time.monotonic()
+                    started_mono = conversion_options.get("_export_started_mono") or now
+                    eta = format_export_eta(now - started_mono, overall_done, progress_total)
+                    self.root.after(
+                        0,
+                        lambda f=current_file, cur=overall_done, tot=progress_total, lg=lang, e=eta: self.status_label.config(
+                            text=(
+                                t(lg, "status_converting_eta", name=f, cur=cur, total=tot, eta=e)
+                                if e
+                                else t(lg, "status_converting", name=f, cur=cur, total=tot)
+                            )
+                        ),
+                    )
+                    self.root.after(0, lambda v=overall_done: self.progress.config(value=v))
+                if recovery and CHECKPOINT_EVERY > 0 and done % CHECKPOINT_EVERY == 0:
+                    recovery.save_checkpoint(
+                        {
+                            "app_version": APP_VERSION,
+                            "processed_count": progress_offset + done,
+                            "converted": converted,
+                            "skipped": skipped,
+                            "errors": errors,
+                            "last_file": file_path,
+                            "cancelled": False,
+                        }
+                    )
+                if rate_limiter:
+                    rate_limiter.wait_if_needed()
+                elif COM_PACE_SEC > 0:
+                    time.sleep(COM_PACE_SEC)
+        finally:
+            pipeline.shutdown()
+            if prefetcher is not None:
+                prefetcher.shutdown(cancel_pending=cancelled)
+        return converted, skipped, errors, error_messages, skipped_messages, cancelled
+
     def _process_email_files(
         self,
         outlook,
@@ -5266,6 +5562,15 @@ class EmlToPstConverter:
         progress_total: int | None = None,
     ):
         """Process all email files"""
+        if conversion_options.get("use_com_pipeline"):
+            return self._process_email_files_com_pipeline(
+                files_to_process,
+                total,
+                conversion_options,
+                folder_cache,
+                progress_offset=progress_offset,
+                progress_total=progress_total,
+            )
         if progress_total is None:
             progress_total = total
         converted = 0
@@ -5302,7 +5607,7 @@ class EmlToPstConverter:
                 parallel_workers,
                 " + MIME parse" if conversion_options.get("parallel_parse") else "",
             )
-            prefetcher = EmlPrepPrefetcher(
+            prefetcher = create_eml_prep_prefetcher(
                 lambda p, opts=conversion_options: self._prep_eml_without_com(p, opts),
                 max_workers=parallel_workers,
             )

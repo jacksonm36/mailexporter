@@ -200,12 +200,49 @@ def verify_executable(exe_path: str) -> bool:
     return True
 
 
+def _resolve_env_file(script_dir: str, env_file: str | None) -> str | None:
+    if env_file:
+        path = os.path.normpath(os.path.expandvars(env_file))
+        return path if os.path.isfile(path) else None
+    for name in (".env", ".env.example"):
+        path = os.path.join(script_dir, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def prepare_build_env(script_dir: str, env_file: str | None, *, embed: bool) -> str | None:
+    """Generate embedded_env.py from .env and return the source path used."""
+    from env_config import generate_embedded_env_py, parse_dotenv
+
+    out = os.path.join(script_dir, "embedded_env.py")
+    if env_file is None:
+        return None
+    if embed:
+        if generate_embedded_env_py(env_file, out, source_label=os.path.basename(env_file)):
+            n = len(parse_dotenv(env_file))
+            print(f"Embedded {n} EML2PST_* setting(s) from {env_file} -> embedded_env.py")
+    return env_file
+
+
+def _deploy_env_file(exe_path: str, env_source: str | None) -> None:
+    if not env_source or not os.path.isfile(exe_path):
+        return
+    from env_config import copy_env_beside_exe
+
+    dest = copy_env_beside_exe(exe_path, env_source)
+    if dest:
+        print(f"Copied {env_source} -> {dest} (edit beside exe to override embedded defaults)")
+
+
 def build_executable(
     *,
     onedir: bool = False,
     dist_dir: str | None = None,
     python_exe: str | None = None,
     checker: bool = False,
+    env_file: str | None = None,
+    embed_env: bool = True,
 ) -> bool:
     python_exe = python_exe or sys.executable
     arch = get_python_arch_for(python_exe)
@@ -239,6 +276,11 @@ def build_executable(
         print(f"Error: {main_script} not found")
         return False
 
+    env_source = None
+    if not checker:
+        resolved_env = _resolve_env_file(script_dir, env_file)
+        env_source = prepare_build_env(script_dir, resolved_env, embed=embed_env)
+
     window_flag = "--console" if checker else "--windowed"
     cmd = [
         python_exe,
@@ -255,6 +297,8 @@ def build_executable(
         "--hidden-import=win32com.client",
         "--hidden-import=pythoncom",
         "--hidden-import=pywintypes",
+        "--hidden-import=env_config",
+        "--hidden-import=embedded_env",
     ]
     if onedir:
         cmd.append("--onedir")
@@ -315,6 +359,9 @@ def build_executable(
     if not verify_executable(exe_path):
         return False
 
+    if not checker and env_source:
+        _deploy_env_file(exe_path, env_source)
+
     size_mb = os.path.getsize(exe_path) / (1024 * 1024)
     print(f"\nSUCCESS: {exe_path} ({size_mb:.1f} MB)")
     print(f"Built for {arch}-bit Outlook — match exe bitness to your Outlook install.")
@@ -349,6 +396,8 @@ def build_for_arch(
     dist_dir: str,
     python_exe: str | None = None,
     checker: bool = False,
+    env_file: str | None = None,
+    embed_env: bool = True,
 ) -> bool:
     if python_exe is None:
         python_exe = resolve_python_for_arch(target_arch)
@@ -372,6 +421,8 @@ def build_for_arch(
         dist_dir=dist_dir,
         python_exe=python_exe,
         checker=checker,
+        env_file=env_file,
+        embed_env=embed_env,
     )
 
 
@@ -405,6 +456,16 @@ def main() -> int:
         "--checker",
         action="store_true",
         help="Build ExportChecker_x32/x64.exe (PST validation CLI) instead of MailExporter",
+    )
+    parser.add_argument(
+        "--env-file",
+        default=None,
+        help="Path to .env to embed and copy beside exe (default: ./.env or ./.env.example)",
+    )
+    parser.add_argument(
+        "--no-embed-env",
+        action="store_true",
+        help="Do not bake .env into embedded_env.py (still copies .env next to exe if present)",
     )
     args = parser.parse_args()
 
@@ -440,6 +501,8 @@ def main() -> int:
             dist_dir=dist_dir,
             python_exe=python_exe,
             checker=args.checker,
+            env_file=args.env_file,
+            embed_env=not args.no_embed_env,
         )
         if not ok:
             all_ok = False

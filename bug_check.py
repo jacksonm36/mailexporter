@@ -875,6 +875,75 @@ def main() -> int:
         errors.append(f"parallel_processor: {exc}")
 
     try:
+        from com_pipeline import ComImportPipeline, ImportResult, com_pipeline_should_run
+
+        if not hasattr(ImportResult, "status"):
+            errors.append("ImportResult missing status field")
+        if com_pipeline_should_run() and os.environ.get("EML2PST_COM_WORKERS", "").strip() == "99":
+            pass  # >1 still returns True with warning path
+        done = []
+
+        def _fake_import(path, prep):
+            done.append(path)
+            return ImportResult(path=path, success=True, status="converted", detail="")
+
+        pipe = ComImportPipeline(import_one=_fake_import)
+        pipe.start()
+        pipe.submit(__file__)
+        res = pipe.get_result(timeout=5.0)
+        pipe.shutdown()
+        if not done or res is None or res.status != "converted":
+            errors.append("ComImportPipeline smoke failed")
+    except Exception as exc:
+        errors.append(f"com_pipeline: {exc}")
+
+    try:
+        import tempfile as _tf
+
+        from env_config import (
+            apply_env_mapping,
+            generate_embedded_env_py,
+            parse_dotenv,
+        )
+
+        with _tf.NamedTemporaryFile(mode="w", suffix=".env", delete=False, encoding="utf-8") as tmp:
+            tmp.write("# comment\nEML2PST_PARALLEL_WORKERS=7\n")
+            env_path = tmp.name
+        try:
+            parsed = parse_dotenv(env_path)
+            if parsed.get("EML2PST_PARALLEL_WORKERS") != "7":
+                errors.append("parse_dotenv failed")
+            out_py = env_path + ".py"
+            if generate_embedded_env_py(env_path, out_py):
+                with open(out_py, encoding="utf-8") as handle:
+                    if "EML2PST_PARALLEL_WORKERS" not in handle.read():
+                        errors.append("generate_embedded_env_py content")
+            os.environ.pop("EML2PST_BUGCHECK_TMP", None)
+            apply_env_mapping({"EML2PST_BUGCHECK_TMP": "1"}, override=False)
+        finally:
+            for p in (env_path, env_path + ".py"):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            os.environ.pop("EML2PST_BUGCHECK_TMP", None)
+    except Exception as exc:
+        errors.append(f"env_config: {exc}")
+
+    try:
+        from async_processor import ASYNC_IO_ENABLED, read_header_block_sync
+
+        if read_header_block_sync(__file__, 64) is None:
+            errors.append("read_header_block_sync returned None")
+        from parallel_processor import create_eml_prep_prefetcher
+
+        pf = create_eml_prep_prefetcher(lambda p: None, max_workers=0)
+        if pf is None:
+            errors.append("create_eml_prep_prefetcher returned None")
+    except Exception as exc:
+        errors.append(f"async_processor: {exc}")
+
+    try:
         import export_checker as _ec
 
         if not hasattr(_ec, "scan_pst"):

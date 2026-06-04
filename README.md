@@ -122,6 +122,28 @@ Use the **Live Mail Folder** button to scan it automatically.
 - To write plain UTF-8 without BOM: set `EML2PST_CSV_BOM=0` before starting.
 - Paths and detail fields are sanitized for Excel formula injection (`csv_sanitize`).
 
+## `.env` file (recommended for VM / exe)
+
+Settings can live in a **`.env`** file instead of Windows environment variables.
+
+| Location | When |
+|----------|------|
+| Next to `MailExporter_x32.exe` | After build (copied automatically) or hand-placed on the VM |
+| Project root `.env` | `python eml_to_pst_converter.py` dev runs |
+| Baked into the exe | `build_exe.py` reads `.env` (or `.env.example`) → `embedded_env.py` |
+
+**Priority:** Windows env vars (set before launch) → `.env` beside exe → values embedded at build time.
+
+```text
+copy .env.example .env
+# edit .env, then:
+python build_exe.py --arch 32
+```
+
+Build flags: `--env-file path\to\.env`, `--no-embed-env` (copy only, do not bake into exe).
+
+Only `EML2PST_*` keys are loaded. See [.env.example](.env.example).
+
 ## Environment variables (common)
 
 | Variable | Default | Purpose |
@@ -134,6 +156,9 @@ Use the **Live Mail Folder** button to scan it automatically.
 | `EML2PST_SLOW_FILE_SEC` | `120` | Log warning if one file exceeds this |
 | `EML2PST_MMAP_THRESHOLD_MB` | `4` | Use memory-mapped reads for larger `.eml` files (`0` = off) |
 | `EML2PST_PARALLEL_WORKERS` | `0` | Parallel prep threads for dedup fingerprints (`0` = off). **Outlook import stays single-threaded.** |
+| `EML2PST_ASYNC_IO` | `0` | Asyncio-backed prep scheduler (`1` = on; `pip install aiofiles` optional) |
+| `EML2PST_COM_PIPELINE` | `0` | Dedicated COM worker thread (overlap prep + import; one PST, one STA thread) |
+| `EML2PST_COM_WORKERS` | `0` | `1` = same as pipeline; `>1` **not supported** (logged, forced to 1) |
 | `EML2PST_PARALLEL_PARSE` | `0` | Also parse MIME in parallel (high RAM on huge jobs) |
 | `EML2PST_DEDUP_STRATEGY` | `content_hash` | `message_id`, `fuzzy_subject`, or `thread` |
 | `EML2PST_ADAPTIVE_RATE` | `0` | Adaptive COM pacing on failures |
