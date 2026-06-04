@@ -19,6 +19,7 @@ def main() -> int:
         count_converted_in_csv,
         export_log_paths,
         load_resume_paths,
+        validate_import_path,
         load_resume_paths_from_sqlite,
         logger,
         normalize_pst_path,
@@ -95,6 +96,34 @@ def main() -> int:
         errors.append("_is_outlook_path_open_error")
     if not _is_outlook_path_open_error("Invalid path or URL."):
         errors.append("_is_outlook_path_open_error invalid path")
+
+    with tempfile.TemporaryDirectory() as sec_tmp:
+        base = os.path.join(sec_tmp, "mail")
+        os.makedirs(base)
+        inside = os.path.join(base, "a.eml")
+        open(inside, "w", encoding="utf-8").close()
+        try:
+            validate_import_path(base, inside)
+        except ValueError as exc:
+            errors.append(f"validate_import_path inside base: {exc}")
+        try:
+            validate_import_path(base, os.path.join("..", "evil.eml"))
+            errors.append("validate_import_path should block ..")
+        except ValueError:
+            pass
+        from path_security import PathSecurityError, PathValidator
+
+        if not PathValidator.create_safe_filename("..\\evil.pdf"):
+            errors.append("create_safe_filename empty")
+        if PathValidator.create_safe_filename("report<1>.eml") != "report_1_.eml":
+            errors.append("create_safe_filename dangerous chars")
+        if PathValidator.create_safe_filename("file;rm -rf /") != "file_rm -rf":
+            errors.append("create_safe_filename semicolon")
+        try:
+            PathValidator.sanitize_path("..\\x.eml", base)
+            errors.append("PathValidator.sanitize_path should block ..")
+        except PathSecurityError:
+            pass
 
     fixed_name = EmlToPstConverter._decode_mime_header_field("PatÃ³cs")
     if "ó" not in fixed_name:
@@ -763,6 +792,87 @@ def main() -> int:
         )
         if ISSUE_WRONG_FOLDER not in {i.code for i in finsp.issues}:
             errors.append("append_folder_placement_issues wrong_folder")
+
+    try:
+        from mmap_processor import (
+            hash_file_sha256,
+            needs_lf_to_crlf_conversion,
+            parse_message_from_path,
+            read_file_bytes,
+            write_crlf_normalized_file,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".eml", delete=False) as tmp:
+            tmp.write(b"From: a@b.com\r\nSubject: mmap test\r\n\r\nBody\r\n")
+            tmp_path = tmp.name
+        try:
+            msg = parse_message_from_path(tmp_path)
+            if msg is None or msg.get("Subject") != "mmap test":
+                errors.append("parse_message_from_path failed")
+            digest = hash_file_sha256(tmp_path)
+            if not digest or len(digest) != 64:
+                errors.append("hash_file_sha256 failed")
+            raw = read_file_bytes(tmp_path)
+            if raw is None or b"mmap test" not in raw:
+                errors.append("read_file_bytes failed")
+            lf_path = tmp_path + ".lf.eml"
+            with open(lf_path, "wb") as lf:
+                lf.write(b"From: a@b.com\nSubject: lf\n\nHi\n")
+            if not needs_lf_to_crlf_conversion(lf_path):
+                errors.append("needs_lf_to_crlf_conversion should detect LF-only")
+            crlf_path = tmp_path + ".crlf.eml"
+            write_crlf_normalized_file(lf_path, crlf_path)
+            with open(crlf_path, "rb") as handle:
+                data = handle.read()
+            if b"\r\n" not in data or b"From: a@b.com\n" in data:
+                errors.append("write_crlf_normalized_file did not CRLF-normalize")
+            for extra in (lf_path, crlf_path):
+                try:
+                    os.remove(extra)
+                except OSError:
+                    pass
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    except Exception as exc:
+        errors.append(f"mmap_processor: {exc}")
+
+    try:
+        from parallel_processor import EmlPrepPrefetcher, ParallelEmailProcessor
+
+        if ParallelEmailProcessor().max_workers < 1:
+            errors.append("ParallelEmailProcessor max_workers")
+        results = []
+
+        def _fake_prep(path: str):
+            from parallel_processor import EmlPrepResult
+
+            return EmlPrepResult(
+                file_path=path,
+                norm_path=os.path.normpath(os.path.abspath(path)),
+                size=1,
+                dedup_key="abc",
+            )
+
+        with tempfile.NamedTemporaryFile(suffix=".eml", delete=False) as tmp:
+            tmp.write(b"x")
+            p = tmp.name
+        try:
+            pf = EmlPrepPrefetcher(_fake_prep, max_workers=2)
+            pf.start([p])
+            got = pf.take(os.path.normpath(os.path.abspath(p)), timeout=10.0)
+            if got is None or got.dedup_key != "abc":
+                errors.append("EmlPrepPrefetcher take failed")
+            pf.shutdown()
+        finally:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    except Exception as exc:
+        errors.append(f"parallel_processor: {exc}")
 
     try:
         import export_checker as _ec

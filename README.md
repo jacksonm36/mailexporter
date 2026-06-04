@@ -132,8 +132,25 @@ Use the **Live Mail Folder** button to scan it automatically.
 | `EML2PST_DEDUP_BACKEND` | `auto` | `sqlite` for large jobs |
 | `EML2PST_CSV_BOM` | `1` | UTF-8 BOM on new CSV |
 | `EML2PST_SLOW_FILE_SEC` | `120` | Log warning if one file exceeds this |
+| `EML2PST_MMAP_THRESHOLD_MB` | `4` | Use memory-mapped reads for larger `.eml` files (`0` = off) |
+| `EML2PST_PARALLEL_WORKERS` | `0` | Parallel prep threads for dedup fingerprints (`0` = off). **Outlook import stays single-threaded.** |
+| `EML2PST_PARALLEL_PARSE` | `0` | Also parse MIME in parallel (high RAM on huge jobs) |
+| `EML2PST_DEDUP_STRATEGY` | `content_hash` | `message_id`, `fuzzy_subject`, or `thread` |
+| `EML2PST_ADAPTIVE_RATE` | `0` | Adaptive COM pacing on failures |
+| `EML2PST_CHECKPOINT_EVERY` | `0` | JSON checkpoint every N messages (off=0) |
+| `EML2PST_FILTER_MAX_MB` | — | Skip .eml larger than N MB |
+| `EML2PST_FILTER_ATTACHMENTS` | — | `only` or `none` |
+
+See [PERFORMANCE_FEATURES.md](PERFORMANCE_FEATURES.md) for the full feature matrix (items 1–12).
 
 See `CHANGELOG.md` for the full v1.0.2 list.
+
+## Security tests
+
+```bash
+python test_security.py
+python bug_check.py
+```
 
 ## License
 

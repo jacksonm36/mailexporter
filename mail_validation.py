@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from email import policy
 from email.header import decode_header
 from email.parser import BytesParser
+
+from mmap_processor import parse_message_from_path
 from email.utils import parseaddr
 
 # Issue codes (stable for reports and CI)
@@ -337,12 +339,8 @@ def extract_eml_body_and_attachments(msg) -> tuple[str, int, bool]:
 
 def parse_eml_summary(file_path: str) -> dict | None:
     """Lightweight .eml parse for validation (no Outlook)."""
-    try:
-        with open(file_path, "rb") as handle:
-            msg = BytesParser(policy=policy.default).parse(handle)
-    except OSError:
-        return None
-    except Exception:
+    msg = parse_message_from_path(file_path)
+    if msg is None:
         return None
     subject = decode_mime_header_field(msg.get("Subject"))
     body, att_count, is_html = extract_eml_body_and_attachments(msg)

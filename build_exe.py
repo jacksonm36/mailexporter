@@ -262,6 +262,10 @@ def build_executable(
         cmd.append("--onefile")
     for mod in EXCLUDE_MODULES:
         cmd.append(f"--exclude-module={mod}")
+    if sys.platform == "win32" and not checker:
+        version_file = os.path.join(script_dir, "version_info.py")
+        if os.path.isfile(version_file):
+            cmd.append(f"--version-file={version_file}")
     cmd.append(main_script)
 
     mode = "folder bundle" if onedir else "single-file"

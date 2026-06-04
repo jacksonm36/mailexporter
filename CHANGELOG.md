@@ -19,6 +19,9 @@
 
 ### Performance
 
+- **`path_security.py`**: `PathValidator` / `PathSecurityError` for traversal, extension checks, safe filenames, and optional `scan_directory_safe`.
+- **Parallel prep** (`parallel_processor.py`, `EML2PST_PARALLEL_WORKERS`): thread pool prefetches dedup fingerprints while COM import runs on the main thread. Do not parallelize Outlook COM (unstable).
+- **Memory-mapped I/O** for large `.eml` files (`mmap_processor.py`, default from 4 MB via `EML2PST_MMAP_THRESHOLD_MB`): parsing, SHA-256 dedup, fingerprint head/tail, and streamed CRLF staging without loading the full file into RAM.
 - SQLite dedup for large mailboxes (default from 200k files).
 - File sizes cached at scan time (avoids repeated `stat()` during export).
 - Faster CRLF normalization for native import staging.

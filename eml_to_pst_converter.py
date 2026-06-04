@@ -41,6 +41,30 @@ from i18n import (
 )
 APP_VERSION = "1.0.2"
 
+from path_security import PathSecurityError, PathValidator
+from cache_manager import file_cache_key, parse_headers_cached
+from email_filter import EmailFilter
+from rate_limiter import ADAPTIVE_RATE_ENABLED, AdaptiveRateLimiter
+from recovery_manager import RecoveryManager
+from smart_dedup import dedup_key_from_header_sample, normalize_strategy
+from parallel_processor import (
+    PARALLEL_PREP_WORKERS,
+    EmlPrepPrefetcher,
+    EmlPrepResult,
+)
+from mmap_processor import (
+    MMAP_READ_THRESHOLD,
+    read_head_tail_samples,
+    copy_file_mmap,
+    file_size_or_zero,
+    hash_file_sha256,
+    needs_lf_to_crlf_conversion,
+    parse_message_from_path,
+    read_file_bytes,
+    read_head_tail_samples,
+    should_use_mmap,
+    write_crlf_normalized_file,
+)
 from mail_validation import (
     ISSUE_WRONG_FOLDER,
     ISSUE_WRONG_PST_STORE,
@@ -335,6 +359,30 @@ CSV_UTF8_BOM = os.environ.get("EML2PST_CSV_BOM", "1").strip().lower() not in (
     "no",
 )
 SLOW_FILE_WARN_SEC = _env_float("EML2PST_SLOW_FILE_SEC", 120.0, lo=0.0, hi=3600.0)
+PARALLEL_PARSE = os.environ.get("EML2PST_PARALLEL_PARSE", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+DEDUP_STRATEGY = normalize_strategy(os.environ.get("EML2PST_DEDUP_STRATEGY", "content_hash"))
+CHECKPOINT_EVERY = _env_int("EML2PST_CHECKPOINT_EVERY", 0, lo=0, hi=50_000)
+
+
+def _build_email_filter_from_env() -> EmailFilter | None:
+    """Optional export filters from environment (all off by default)."""
+    filt = EmailFilter()
+    max_mb = os.environ.get("EML2PST_FILTER_MAX_MB", "").strip()
+    if max_mb:
+        try:
+            filt.add_size_filter(int(float(max_mb) * 1024 * 1024))
+        except ValueError:
+            pass
+    att = os.environ.get("EML2PST_FILTER_ATTACHMENTS", "").strip().lower()
+    if att == "only":
+        filt.add_attachment_filter(has_attachments=True)
+    elif att == "none":
+        filt.add_attachment_filter(has_attachments=False)
+    return filt if filt.enabled else None
 COM_RPC_COOLDOWN = _env_float("EML2PST_RPC_COOLDOWN", 5.0, lo=1.0, hi=120.0)
 STAGING_WRITE_SETTLE = _env_float("EML2PST_STAGING_SETTLE", 0.35, lo=0.05, hi=5.0)
 COM_PACE_SEC = _env_float("EML2PST_COM_PACE", 0.02, lo=0.0, hi=2.0)
@@ -803,6 +851,17 @@ def normalize_pst_path(pst_path: str) -> str:
     return path
 
 
+def validate_import_path(base_dir: str, user_path: str) -> str:
+    """
+    Resolve user_path and ensure it stays under base_dir (blocks .. traversal).
+    Delegates to path_security.PathValidator.
+    """
+    try:
+        return PathValidator.sanitize_path(user_path, base_dir, allow_absolute=True)
+    except PathSecurityError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def pst_paths_equal(left: str, right: str) -> bool:
     """Compare PST paths on disk (case-insensitive on Windows)."""
     if not left or not right:
@@ -851,7 +910,7 @@ def _legacy_export_log_path(log_path: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(log_path)), "export_log.txt")
 
 
-def load_resume_paths(csv_path: str) -> set[str]:
+def load_resume_paths(csv_path: str, *, source_root: str = "") -> set[str]:
     """Paths successfully converted in a prior run."""
     done: set[str] = set()
     if not os.path.isfile(csv_path):
@@ -861,8 +920,17 @@ def load_resume_paths(csv_path: str) -> set[str]:
             for row in csv.DictReader(handle):
                 if (row.get("status") or "").lower() == "converted":
                     path = row.get("file_path", "").strip()
-                    if path:
-                        done.add(os.path.normpath(os.path.abspath(path)))
+                    if not path:
+                        continue
+                    try:
+                        if source_root:
+                            path = validate_import_path(source_root, path)
+                        else:
+                            path = os.path.normpath(os.path.abspath(path))
+                    except ValueError as exc:
+                        logger.warning("Resume path skipped: %s", exc)
+                        continue
+                    done.add(path)
     except OSError as exc:
         logger.warning("Could not read resume log %s: %s", csv_path, exc)
     return done
@@ -1700,11 +1768,21 @@ class EmlToPstConverter:
                 self.pst_option.set("new")
             
     def get_email_hash(self, file_path):
-        """Full SHA-256 for duplicate detection (used when fingerprint collides)."""
+        """Full SHA-256 for duplicate detection (used when FULL_DEDUP is enabled)."""
+        sz = file_size_or_zero(file_path)
+        if should_use_mmap(sz):
+            digest = hash_file_sha256(file_path)
+            if digest is None:
+                logger.warning(
+                    "Could not hash file %s: %s",
+                    log_sanitize(file_path),
+                    "mmap read failed",
+                )
+            return digest
         try:
             sha256 = hashlib.sha256()
-            with open(file_path, 'rb') as f:
-                for chunk in iter(lambda: f.read(65536), b''):
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
                     sha256.update(chunk)
             return sha256.hexdigest()
         except OSError as e:
@@ -1744,16 +1822,25 @@ class EmlToPstConverter:
             digest = hashlib.sha256()
             digest.update(str(size).encode("ascii"))
             header_date = ""
-            with open(file_path, "rb") as handle:
-                head = handle.read(65536)
-                header_date = self._extract_date_from_rfc822_sample(head)
-                digest.update(head)
-                if header_date:
-                    digest.update(b"\x00hdr-date\x00")
-                    digest.update(header_date.encode("utf-8", errors="replace"))
-                if size > 131072:
-                    handle.seek(size - 65536)
-                    digest.update(handle.read(65536))
+            if should_use_mmap(size):
+                samples = read_head_tail_samples(file_path, size)
+                if samples is None:
+                    return None
+                head, tail = samples
+            else:
+                with open(file_path, "rb") as handle:
+                    head = handle.read(65536)
+                    tail = b""
+                    if size > 131072:
+                        handle.seek(size - 65536)
+                        tail = handle.read(65536)
+            header_date = self._extract_date_from_rfc822_sample(head)
+            digest.update(head)
+            if header_date:
+                digest.update(b"\x00hdr-date\x00")
+                digest.update(header_date.encode("utf-8", errors="replace"))
+            if tail:
+                digest.update(tail)
             return digest.hexdigest(), header_date
         except OSError as e:
             logger.warning(
@@ -1922,9 +2009,10 @@ class EmlToPstConverter:
         stay available for transport-header and date preservation in Outlook.
         """
         try:
-            with open(file_path, 'rb') as f:
-                msg = BytesParser(policy=policy.default).parse(f)
-            
+            msg = parse_message_from_path(file_path)
+            if msg is None:
+                return None
+
             subject = self._decode_mime_header_field(msg.get("Subject"))
             return {
                 'subject': subject or "(No Subject)",
@@ -2338,19 +2426,8 @@ class EmlToPstConverter:
         return attachments
     
     def _sanitize_filename(self, filename):
-        """Sanitize filename to prevent path traversal attacks"""
-        # Remove any path components
-        filename = os.path.basename(filename)
-        # Remove potentially dangerous characters
-        filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', filename)
-        # Ensure non-empty
-        if not filename:
-            filename = "attachment"
-        # Limit length
-        if len(filename) > 200:
-            name, ext = os.path.splitext(filename)
-            filename = name[:200-len(ext)] + ext
-        return filename
+        """Sanitize filename to prevent path traversal attacks."""
+        return PathValidator.create_safe_filename(filename, max_length=200)
         
     def _on_close(self):
         """Handle window close with proper cleanup"""
@@ -2935,6 +3012,8 @@ class EmlToPstConverter:
             ),
             "pst_chunk_size": PST_CHUNK_SIZE,
             "validate_import": VALIDATE_IMPORT,
+            "parallel_workers": PARALLEL_PREP_WORKERS,
+            "parallel_parse": PARALLEL_PARSE,
         }
 
         if conversion_options["pst_option"] == "mailbox":
@@ -3037,9 +3116,18 @@ class EmlToPstConverter:
         if conversion_options.get("resume_from_log"):
             logger.info("Loading resume state from %s ...", csv_path)
             self._flush_export_log()
-            resume_paths = load_resume_paths(csv_path)
+            source_root = conversion_options.get("source_root") or ""
+            resume_paths = load_resume_paths(csv_path, source_root=source_root)
             db_path = self._dedup_db_path(conversion_options)
             sqlite_paths = load_resume_paths_from_sqlite(db_path)
+            if sqlite_paths and source_root:
+                safe_sqlite: set[str] = set()
+                for p in sqlite_paths:
+                    try:
+                        safe_sqlite.add(validate_import_path(source_root, p))
+                    except ValueError as exc:
+                        logger.warning("Resume SQLite path skipped: %s", exc)
+                sqlite_paths = safe_sqlite
             if sqlite_paths:
                 extra = len(sqlite_paths - resume_paths)
                 resume_paths |= sqlite_paths
@@ -3052,6 +3140,30 @@ class EmlToPstConverter:
             logger.info("Resume: %d file(s) already marked converted", len(resume_paths))
             self._flush_export_log()
         conversion_options["resume_paths"] = resume_paths
+
+        email_filter = _build_email_filter_from_env()
+        if email_filter:
+            conversion_options["email_filter"] = email_filter
+            logger.info("Pre-import email filters: ON")
+        if ADAPTIVE_RATE_ENABLED:
+            conversion_options["_rate_limiter"] = AdaptiveRateLimiter()
+            logger.info("Adaptive COM pacing: ON (EML2PST_ADAPTIVE_RATE)")
+        if CHECKPOINT_EVERY > 0:
+            ck_base = export_output_dir(
+                conversion_options.get("source_root", ""),
+                conversion_options.get("destination_path", ""),
+                export_mode,
+            )
+            conversion_options["_recovery"] = RecoveryManager(
+                os.path.join(ck_base, "checkpoints")
+            )
+            logger.info(
+                "Export checkpoints every %d message(s) in %s/checkpoints",
+                CHECKPOINT_EVERY,
+                ck_base,
+            )
+        if DEDUP_STRATEGY != "content_hash":
+            logger.info("Dedup strategy: %s (EML2PST_DEDUP_STRATEGY)", DEDUP_STRATEGY)
 
         append_csv = bool(resume_paths) and conversion_options.get(
             "resume_from_log"
@@ -3098,6 +3210,11 @@ class EmlToPstConverter:
         self._import_validation_repairs = 0
         self._import_validation_rebuilds = 0
         self._import_validation_failures = 0
+        if MMAP_READ_THRESHOLD > 0:
+            logger.info(
+                "Large .eml I/O: memory-mapped reads from %d MB (EML2PST_MMAP_THRESHOLD_MB)",
+                MMAP_READ_THRESHOLD // (1024 * 1024),
+            )
         if conversion_options.get("validate_import", VALIDATE_IMPORT):
             logger.info(
                 "Per-message import validation: ON (folder placement, sender/subject, "
@@ -3253,6 +3370,14 @@ class EmlToPstConverter:
 
     def _dedup_key_for_file(self, file_path: str, size: int) -> tuple[str, str] | None:
         """Return (dedup_hash, header_date) — hash includes Date: when fingerprinting."""
+        if not FULL_DEDUP_HASH and DEDUP_STRATEGY != "content_hash":
+            samples = read_head_tail_samples(file_path, size, head_len=65536, tail_len=0)
+            if samples:
+                head, _tail = samples
+                alt = dedup_key_from_header_sample(head, DEDUP_STRATEGY, size)
+                if alt:
+                    header_date = self._extract_date_from_rfc822_sample(head)
+                    return alt, header_date
         if FULL_DEDUP_HASH:
             full_hash = self.get_email_hash(file_path)
             if not full_hash:
@@ -5080,6 +5205,53 @@ class EmlToPstConverter:
         except OSError:
             pass
 
+    def _prep_eml_without_com(
+        self, file_path: str, conversion_options: dict
+    ) -> EmlPrepResult:
+        """Disk/CPU prep for one .eml (no Outlook COM). Used by parallel prefetch workers."""
+        norm_path = os.path.normpath(os.path.abspath(file_path))
+        try:
+            sz = self._eml_file_sizes.get(norm_path)
+            if sz is None:
+                sz = os.path.getsize(file_path)
+        except OSError as e:
+            return EmlPrepResult(
+                file_path=file_path,
+                norm_path=norm_path,
+                size=0,
+                prep_error=f"Cannot read file: {e}",
+            )
+        dedup_key = None
+        header_date = ""
+        if conversion_options.get("remove_duplicates"):
+            dedup_pair = self._dedup_key_for_file(file_path, sz)
+            if dedup_pair is None:
+                if FULL_DEDUP_HASH:
+                    return EmlPrepResult(
+                        file_path=file_path,
+                        norm_path=norm_path,
+                        size=sz,
+                        prep_error="Cannot compute duplicate hash",
+                    )
+                return EmlPrepResult(
+                    file_path=file_path,
+                    norm_path=norm_path,
+                    size=sz,
+                    prep_error="Cannot compute duplicate fingerprint",
+                )
+            dedup_key, header_date = dedup_pair
+        email_data = None
+        if conversion_options.get("parallel_parse"):
+            email_data = self.parse_eml(file_path)
+        return EmlPrepResult(
+            file_path=file_path,
+            norm_path=norm_path,
+            size=sz,
+            dedup_key=dedup_key,
+            header_date=header_date,
+            email_data=email_data,
+        )
+
     def _process_email_files(
         self,
         outlook,
@@ -5111,6 +5283,8 @@ class EmlToPstConverter:
         }
         consecutive_rpc_failures = 0
         last_conv_ui = [0.0]
+        rate_limiter = conversion_options.get("_rate_limiter")
+        recovery = conversion_options.get("_recovery")
         conversion_options.setdefault("_export_started_mono", time.monotonic())
         logger.info(
             "Processing %d file(s); overall progress target %d",
@@ -5119,61 +5293,60 @@ class EmlToPstConverter:
         )
         self._flush_export_log()
         lang = conversion_options.get("lang", LANG_EN)
-        for i, file_path in enumerate(files_to_process):
-            if self._is_cancelled():
-                cancelled = True
-                logger.info("Cancel requested — stopping after %d/%d", i, total)
-                break
-
-            if not self._probe_outlook_application(
-                session["outlook"], conversion_options
-            ):
-                try:
-                    self._refresh_outlook_session_after_failure(
-                        session,
-                        conversion_options,
-                        folder_cache,
-                        lang=lang,
-                        consecutive_failures=consecutive_rpc_failures + 1,
-                    )
-                    consecutive_rpc_failures = 0
-                except Exception as wait_err:
-                    errors += 1
-                    error_messages.append(
-                        f"{os.path.basename(file_path)}: {wait_err}"
-                    )
-                    logger.error("Outlook recovery failed: %s", wait_err)
+        parallel_workers = int(conversion_options.get("parallel_workers") or 0)
+        prefetcher = None
+        if parallel_workers > 0:
+            logger.info(
+                "Parallel prep: %d worker(s) for fingerprints%s "
+                "(Outlook COM import remains single-threaded)",
+                parallel_workers,
+                " + MIME parse" if conversion_options.get("parallel_parse") else "",
+            )
+            prefetcher = EmlPrepPrefetcher(
+                lambda p, opts=conversion_options: self._prep_eml_without_com(p, opts),
+                max_workers=parallel_workers,
+            )
+            prefetcher.start(files_to_process)
+        try:
+            for i, file_path in enumerate(files_to_process):
+                if self._is_cancelled():
+                    cancelled = True
+                    logger.info("Cancel requested — stopping after %d/%d", i, total)
                     break
 
-            current_file = os.path.basename(file_path)
-            started = time.perf_counter()
-            target_label = ""
-            try:
-                dest_folder, target_label = self._resolve_target_folder_for_file(
-                    session["target_folder"], file_path, conversion_options, folder_cache
+                norm_path = os.path.normpath(os.path.abspath(file_path))
+                prep_result = None
+                if prefetcher is not None:
+                    prep_result = prefetcher.take(norm_path)
+                conversion_options["_prep_result"] = prep_result
+                conversion_options["_parsed_email_data"] = (
+                    prep_result.email_data if prep_result else None
                 )
-                status, detail = self._process_single_email(
-                    session["namespace"],
-                    dest_folder,
-                    file_path,
-                    session["outlook"],
-                    conversion_options,
-                )
-                if status == "error" and _is_outlook_unavailable_error(detail):
-                    consecutive_rpc_failures += 1
+
+                if not self._probe_outlook_application(
+                    session["outlook"], conversion_options
+                ):
                     try:
                         self._refresh_outlook_session_after_failure(
                             session,
                             conversion_options,
                             folder_cache,
                             lang=lang,
-                            consecutive_failures=consecutive_rpc_failures,
+                            consecutive_failures=consecutive_rpc_failures + 1,
                         )
+                        consecutive_rpc_failures = 0
                     except Exception as wait_err:
                         errors += 1
-                        error_messages.append(f"{current_file}: {wait_err}")
+                        error_messages.append(
+                            f"{os.path.basename(file_path)}: {wait_err}"
+                        )
                         logger.error("Outlook recovery failed: %s", wait_err)
                         break
+
+                current_file = os.path.basename(file_path)
+                started = time.perf_counter()
+                target_label = ""
+                try:
                     dest_folder, target_label = self._resolve_target_folder_for_file(
                         session["target_folder"], file_path, conversion_options, folder_cache
                     )
@@ -5184,43 +5357,23 @@ class EmlToPstConverter:
                         session["outlook"],
                         conversion_options,
                     )
-                duration = time.perf_counter() - started
-                if SLOW_FILE_WARN_SEC > 0 and duration >= SLOW_FILE_WARN_SEC:
-                    logger.warning(
-                        "Slow message (%.1fs): %s",
-                        duration,
-                        log_sanitize(file_path),
-                    )
-                if status == "converted":
-                    consecutive_rpc_failures = 0
-                    converted += 1
-                elif status == "skipped":
-                    skipped += 1
-                    if detail:
-                        skipped_messages.append(f"{current_file}: {detail}")
-                else:
-                    errors += 1
-                    error_messages.append(f"{current_file}: {detail or 'Unknown error'}")
-                self._write_csv_row(
-                    file_path, status, detail or "", duration, target_label
-                )
-            except Exception as e:
-                duration = time.perf_counter() - started
-                if _is_outlook_unavailable_error(e):
-                    consecutive_rpc_failures += 1
-                    try:
-                        self._refresh_outlook_session_after_failure(
-                            session,
-                            conversion_options,
-                            folder_cache,
-                            lang=lang,
-                            consecutive_failures=consecutive_rpc_failures,
-                        )
+                    if status == "error" and _is_outlook_unavailable_error(detail):
+                        consecutive_rpc_failures += 1
+                        try:
+                            self._refresh_outlook_session_after_failure(
+                                session,
+                                conversion_options,
+                                folder_cache,
+                                lang=lang,
+                                consecutive_failures=consecutive_rpc_failures,
+                            )
+                        except Exception as wait_err:
+                            errors += 1
+                            error_messages.append(f"{current_file}: {wait_err}")
+                            logger.error("Outlook recovery failed: %s", wait_err)
+                            break
                         dest_folder, target_label = self._resolve_target_folder_for_file(
-                            session["target_folder"],
-                            file_path,
-                            conversion_options,
-                            folder_cache,
+                            session["target_folder"], file_path, conversion_options, folder_cache
                         )
                         status, detail = self._process_single_email(
                             session["namespace"],
@@ -5229,72 +5382,148 @@ class EmlToPstConverter:
                             session["outlook"],
                             conversion_options,
                         )
-                        duration = time.perf_counter() - started
-                        if status == "converted":
-                            converted += 1
-                        elif status == "skipped":
-                            skipped += 1
-                            if detail:
-                                skipped_messages.append(f"{current_file}: {detail}")
-                        else:
-                            errors += 1
-                            error_messages.append(
-                                f"{current_file}: {detail or 'Unknown error'}"
-                            )
-                        self._write_csv_row(
-                            file_path, status, detail or "", duration, target_label
+                    duration = time.perf_counter() - started
+                    if SLOW_FILE_WARN_SEC > 0 and duration >= SLOW_FILE_WARN_SEC:
+                        logger.warning(
+                            "Slow message (%.1fs): %s",
+                            duration,
+                            log_sanitize(file_path),
                         )
-                        continue
-                    except Exception as retry_err:
-                        e = retry_err
-                errors += 1
-                error_messages.append(f"{current_file}: {e}")
-                logger.error("Error processing %s: %s", log_sanitize(file_path), log_sanitize(e))
-                self._write_csv_row(file_path, "error", str(e), duration, target_label)
-
-            done = i + 1
-            report_progress = (
-                done == 1 or done % CONVERSION_UI_EVERY == 0 or done == total
-            )
-            if report_progress:
-                overall_done = progress_offset + done
-                logger.info(
-                    "Progress %d/%d — %s",
-                    overall_done,
-                    progress_total,
-                    log_sanitize(current_file),
-                )
-                self._flush_export_log()
-                force_ui = done == 1 or done == total
-                now = time.monotonic()
-                if force_ui or (now - last_conv_ui[0]) >= UI_THROTTLE_SEC:
-                    last_conv_ui[0] = now
-                    started_mono = conversion_options.get("_export_started_mono") or now
-                    eta = format_export_eta(now - started_mono, overall_done, progress_total)
-                    self.root.after(
-                        0,
-                        lambda f=current_file, cur=overall_done, tot=progress_total, lg=lang, e=eta: self.status_label.config(
-                            text=(
-                                t(lg, "status_converting_eta", name=f, cur=cur, total=tot, eta=e)
-                                if e
-                                else t(lg, "status_converting", name=f, cur=cur, total=tot)
+                    if status == "converted":
+                        consecutive_rpc_failures = 0
+                        converted += 1
+                        if rate_limiter:
+                            rate_limiter.record_success()
+                    elif status == "skipped":
+                        skipped += 1
+                        if detail:
+                            skipped_messages.append(f"{current_file}: {detail}")
+                    else:
+                        errors += 1
+                        error_messages.append(f"{current_file}: {detail or 'Unknown error'}")
+                        if rate_limiter:
+                            rate_limiter.record_failure()
+                    self._write_csv_row(
+                        file_path, status, detail or "", duration, target_label
+                    )
+                except Exception as e:
+                    duration = time.perf_counter() - started
+                    if _is_outlook_unavailable_error(e):
+                        consecutive_rpc_failures += 1
+                        try:
+                            self._refresh_outlook_session_after_failure(
+                                session,
+                                conversion_options,
+                                folder_cache,
+                                lang=lang,
+                                consecutive_failures=consecutive_rpc_failures,
                             )
-                        ),
+                            dest_folder, target_label = self._resolve_target_folder_for_file(
+                                session["target_folder"],
+                                file_path,
+                                conversion_options,
+                                folder_cache,
+                            )
+                            status, detail = self._process_single_email(
+                                session["namespace"],
+                                dest_folder,
+                                file_path,
+                                session["outlook"],
+                                conversion_options,
+                            )
+                            duration = time.perf_counter() - started
+                            if status == "converted":
+                                converted += 1
+                            elif status == "skipped":
+                                skipped += 1
+                                if detail:
+                                    skipped_messages.append(f"{current_file}: {detail}")
+                            else:
+                                errors += 1
+                                error_messages.append(
+                                    f"{current_file}: {detail or 'Unknown error'}"
+                                )
+                            self._write_csv_row(
+                                file_path, status, detail or "", duration, target_label
+                            )
+                            continue
+                        except Exception as retry_err:
+                            e = retry_err
+                    errors += 1
+                    error_messages.append(f"{current_file}: {e}")
+                    logger.error("Error processing %s: %s", log_sanitize(file_path), log_sanitize(e))
+                    self._write_csv_row(file_path, "error", str(e), duration, target_label)
+                finally:
+                    conversion_options.pop("_prep_result", None)
+                    conversion_options.pop("_parsed_email_data", None)
+
+                done = i + 1
+                report_progress = (
+                    done == 1 or done % CONVERSION_UI_EVERY == 0 or done == total
+                )
+                if report_progress:
+                    overall_done = progress_offset + done
+                    logger.info(
+                        "Progress %d/%d — %s",
+                        overall_done,
+                        progress_total,
+                        log_sanitize(current_file),
                     )
-                    self.root.after(
-                        0, lambda v=overall_done: self.progress.config(value=v)
+                    self._flush_export_log()
+                    force_ui = done == 1 or done == total
+                    now = time.monotonic()
+                    if force_ui or (now - last_conv_ui[0]) >= UI_THROTTLE_SEC:
+                        last_conv_ui[0] = now
+                        started_mono = conversion_options.get("_export_started_mono") or now
+                        eta = format_export_eta(now - started_mono, overall_done, progress_total)
+                        self.root.after(
+                            0,
+                            lambda f=current_file, cur=overall_done, tot=progress_total, lg=lang, e=eta: self.status_label.config(
+                                text=(
+                                    t(lg, "status_converting_eta", name=f, cur=cur, total=tot, eta=e)
+                                    if e
+                                    else t(lg, "status_converting", name=f, cur=cur, total=tot)
+                                )
+                            ),
+                        )
+                        self.root.after(
+                            0, lambda v=overall_done: self.progress.config(value=v)
+                        )
+
+                if recovery and CHECKPOINT_EVERY > 0 and done % CHECKPOINT_EVERY == 0:
+                    recovery.save_checkpoint(
+                        {
+                            "app_version": APP_VERSION,
+                            "processed_count": progress_offset + done,
+                            "converted": converted,
+                            "skipped": skipped,
+                            "errors": errors,
+                            "last_file": file_path,
+                            "cancelled": False,
+                        }
                     )
 
-            if GC_EVERY_N_FILES and done % GC_EVERY_N_FILES == 0:
-                gc.collect()
+                if GC_EVERY_N_FILES and done % GC_EVERY_N_FILES == 0:
+                    gc.collect()
 
-            if COM_PACE_SEC > 0:
-                time.sleep(COM_PACE_SEC)
-        
+                if rate_limiter:
+                    rate_limiter.wait_if_needed()
+                elif COM_PACE_SEC > 0:
+                    time.sleep(COM_PACE_SEC)
+        finally:
+            if prefetcher is not None:
+                prefetcher.shutdown(cancel_pending=cancelled)
+
         return converted, skipped, errors, error_messages, skipped_messages, cancelled
     
     def _process_single_email(self, namespace, target_folder, file_path, outlook, conversion_options):
         """Process a single email file"""
+        source_root = (conversion_options.get("source_root") or "").strip()
+        if source_root:
+            try:
+                file_path = validate_import_path(source_root, file_path)
+            except ValueError as exc:
+                return "error", str(exc)
         norm_path = os.path.normpath(os.path.abspath(file_path))
         resume_paths = conversion_options.get("resume_paths") or set()
         if norm_path in resume_paths:
@@ -5302,10 +5531,16 @@ class EmlToPstConverter:
                 conversion_options.get("lang", LANG_EN), "skip_resume"
             )
 
+        prep: EmlPrepResult | None = conversion_options.get("_prep_result")
         try:
-            sz = self._eml_file_sizes.get(norm_path)
-            if sz is None:
-                sz = os.path.getsize(file_path)
+            if prep is not None:
+                if prep.prep_error:
+                    return "error", prep.prep_error
+                sz = prep.size
+            else:
+                sz = self._eml_file_sizes.get(norm_path)
+                if sz is None:
+                    sz = os.path.getsize(file_path)
             if sz > MAX_EML_FILE_BYTES:
                 mb = MAX_EML_FILE_BYTES // (1024 * 1024)
                 return (
@@ -5315,14 +5550,36 @@ class EmlToPstConverter:
         except OSError as e:
             return "error", f"Cannot read file: {e}"
 
+        email_filter = conversion_options.get("email_filter")
+        if email_filter and email_filter.enabled:
+            meta = conversion_options.get("_parsed_email_data")
+            if meta is None:
+                meta = self.parse_eml(file_path)
+            if meta:
+                att_count = len(meta.get("attachments") or [])
+                meta_row = {
+                    "subject": meta.get("subject"),
+                    "from": meta.get("from"),
+                    "date": meta.get("date"),
+                    "size": sz,
+                    "attachment_count": att_count,
+                }
+                if not email_filter.apply(meta_row):
+                    return "skipped", "Filtered out by export rules"
+
         # Check for duplicates (fingerprint by default; optional full SHA-256 via EML2PST_FULL_DEDUP)
         if conversion_options["remove_duplicates"]:
-            dedup_pair = self._dedup_key_for_file(file_path, sz)
-            if not dedup_pair:
-                if FULL_DEDUP_HASH:
-                    return "error", "Cannot compute duplicate hash"
-                return "error", "Cannot compute duplicate fingerprint"
-            dedup_key, header_date = dedup_pair
+            if prep is not None and prep.dedup_key is not None:
+                dedup_key, header_date = prep.dedup_key, prep.header_date
+            elif prep is not None and prep.prep_error:
+                return "error", prep.prep_error
+            else:
+                dedup_pair = self._dedup_key_for_file(file_path, sz)
+                if not dedup_pair:
+                    if FULL_DEDUP_HASH:
+                        return "error", "Cannot compute duplicate hash"
+                    return "error", "Cannot compute duplicate fingerprint"
+                dedup_key, header_date = dedup_pair
             if self._is_duplicate_and_mark(dedup_key, header_date):
                 detail = "Duplicate content"
                 if header_date:
@@ -6357,15 +6614,12 @@ class EmlToPstConverter:
         Returns 'converted' or an error string (never raises).
         """
         try:
-            rfc822_bytes = self._load_rfc822_bytes(file_path)
-            if not rfc822_bytes:
+            staged_path = self._stage_rfc822_eml_for_import(file_path, prefix="e")
+            if not staged_path:
+                sz = file_size_or_zero(file_path)
+                if sz > NATIVE_IMPORT_MAX_BYTES:
+                    return "Message too large for staged import"
                 return "Could not read source message content"
-            if len(rfc822_bytes) > NATIVE_IMPORT_MAX_BYTES:
-                return "Message too large for staged import"
-            rfc822_bytes = self._normalize_rfc822_line_endings(rfc822_bytes)
-            staged_path = self._stage_file_for_native_import(
-                file_path, prefix="e", data=rfc822_bytes
-            )
             email_data = self.parse_eml(file_path)
 
             mail_item = self._open_shared_item_from_staged_eml(namespace, staged_path)
@@ -6520,11 +6774,69 @@ class EmlToPstConverter:
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".emlx":
             return self._emlx_to_rfc822_bytes(file_path)
+        return read_file_bytes(file_path)
+
+    def _stage_rfc822_eml_for_import(
+        self, file_path: str, *, prefix: str = "e"
+    ) -> str | None:
+        """
+        Stage .eml for OpenSharedItem without loading multi-MB files into RAM when possible.
+        Returns staged path or None on failure / oversize.
+        """
+        norm = os.path.normpath(os.path.abspath(file_path))
+        sz = self._eml_file_sizes.get(norm)
+        if sz is None:
+            sz = file_size_or_zero(file_path)
+        if sz > NATIVE_IMPORT_MAX_BYTES:
+            return None
+        if should_use_mmap(sz):
+            last_err = None
+            for staging_dir in self._native_temp_staging_dirs(file_path):
+                temp_eml_path = None
+                try:
+                    fd, temp_eml_path = tempfile.mkstemp(
+                        suffix=".eml",
+                        prefix=prefix,
+                        dir=staging_dir,
+                    )
+                    os.close(fd)
+                    if needs_lf_to_crlf_conversion(file_path):
+                        write_crlf_normalized_file(file_path, temp_eml_path)
+                    else:
+                        copy_file_mmap(file_path, temp_eml_path)
+                    if not os.path.isfile(temp_eml_path):
+                        raise OSError(f"staging file missing: {temp_eml_path}")
+                    with self._lock:
+                        self._temp_files.append(temp_eml_path)
+                    self._register_staging_file(temp_eml_path)
+                    self._wait_for_staging_file(temp_eml_path)
+                    return temp_eml_path
+                except Exception as e:
+                    last_err = e
+                    if temp_eml_path:
+                        self._register_staging_file(temp_eml_path)
+                    logger.debug(
+                        "mmap staging failed for %s in %s: %s",
+                        log_sanitize(file_path),
+                        staging_dir,
+                        e,
+                    )
+            logger.debug(
+                "Could not mmap-stage %s: %s",
+                log_sanitize(file_path),
+                last_err,
+            )
+            return None
+
+        rfc822_bytes = self._load_rfc822_bytes(file_path)
+        if not rfc822_bytes:
+            return None
+        rfc822_bytes = self._normalize_rfc822_line_endings(rfc822_bytes)
         try:
-            with open(file_path, "rb") as handle:
-                return handle.read()
-        except OSError as e:
-            logger.debug("Could not read %s: %s", file_path, e)
+            return self._stage_file_for_native_import(
+                file_path, prefix=prefix, data=rfc822_bytes
+            )
+        except OSError:
             return None
 
     def _should_try_native_import(self, file_path: str, file_size: int) -> bool:
@@ -6712,20 +7024,15 @@ class EmlToPstConverter:
 
         # 2) Staged CRLF copy — fixes LF-only test/real mail and deep source paths
         try:
-            rfc822_bytes = self._load_rfc822_bytes(file_path)
-            if not rfc822_bytes:
-                return "Could not read source message content"
-            if len(rfc822_bytes) > NATIVE_IMPORT_MAX_BYTES:
-                return "Message too large for native import"
-            rfc822_bytes = self._normalize_rfc822_line_endings(rfc822_bytes)
             prefix = "import_"
             if ext == ".emlx":
                 prefix = f"emlx_as_eml_{uuid.uuid4().hex[:8]}_"
-            staged_path = self._stage_file_for_native_import(
-                file_path,
-                prefix=prefix,
-                data=rfc822_bytes,
-            )
+            staged_path = self._stage_rfc822_eml_for_import(file_path, prefix=prefix)
+            if not staged_path:
+                sz = file_size_or_zero(file_path)
+                if sz > NATIVE_IMPORT_MAX_BYTES:
+                    return "Message too large for native import"
+                return "Could not read source message content"
             _try_native(staged_path, file_path, allow_uri=False)
             return "converted"
         except Exception as e:
