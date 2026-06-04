@@ -39,10 +39,13 @@ from i18n import (
     lang_from_display,
     t,
 )
+APP_VERSION = "1.0.2"
+
 from mail_validation import (
     ISSUE_WRONG_FOLDER,
     ISSUE_WRONG_PST_STORE,
     append_folder_placement_issues,
+    body_looks_like_html,
     eml_parse_to_summary,
     format_inspection_errors,
     has_import_errors,
@@ -326,6 +329,12 @@ TREE_PREVIEW_CHUNK = _env_int("EML2PST_TREE_CHUNK", 50, lo=10, hi=500)
 GC_EVERY_N_FILES = _env_int("EML2PST_GC_EVERY", 500, lo=0, hi=5000)
 COM_RETRY_ATTEMPTS = _env_int("EML2PST_COM_RETRIES", 3, lo=1, hi=5)
 CSV_FLUSH_EVERY = _env_int("EML2PST_CSV_FLUSH_EVERY", 50, lo=1, hi=1000)
+CSV_UTF8_BOM = os.environ.get("EML2PST_CSV_BOM", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+SLOW_FILE_WARN_SEC = _env_float("EML2PST_SLOW_FILE_SEC", 120.0, lo=0.0, hi=3600.0)
 COM_RPC_COOLDOWN = _env_float("EML2PST_RPC_COOLDOWN", 5.0, lo=1.0, hi=120.0)
 STAGING_WRITE_SETTLE = _env_float("EML2PST_STAGING_SETTLE", 0.35, lo=0.05, hi=5.0)
 COM_PACE_SEC = _env_float("EML2PST_COM_PACE", 0.02, lo=0.0, hi=2.0)
@@ -349,6 +358,8 @@ DEDUP_SQLITE_COMMIT_EVERY = _env_int("EML2PST_DEDUP_SQLITE_COMMIT_EVERY", 500, l
 DEDUP_DB_FILENAME = "dedup_state.sqlite3"
 # Date: header in the first 64KB of each message (dedup keys must not ignore send time).
 _DATE_HEADER_BYTES_RE = re.compile(br"^Date:\s*(.+)$", re.MULTILINE | re.IGNORECASE)
+# Single-pass CRLF normalization (faster than split/join on large .eml bodies).
+_RFC822_CRLF_NORM_RE = re.compile(rb"(?<!\r)\n|\r(?!\n)")
 # Attachment sniff: HTML multipart uses Content-Disposition: inline without filename — not a file.
 _ATTACHMENT_DISPOSITION_SNIFF_RE = re.compile(
     br"content-disposition\s*:\s*attachment\b",
@@ -691,6 +702,33 @@ def log_sanitize(value) -> str:
     return s[:500] if len(s) > 500 else s
 
 
+def format_export_eta(elapsed_sec: float, done: int, total: int) -> str:
+    """Human-readable ETA from average rate (empty until at least two items finished)."""
+    if done < 2 or total <= done or elapsed_sec <= 0:
+        return ""
+    remaining_sec = (total - done) * (elapsed_sec / done)
+    if remaining_sec < 60:
+        return "<1 min"
+    minutes = int(remaining_sec // 60)
+    if minutes < 90:
+        return f"~{minutes} min"
+    hours, mins = divmod(minutes, 60)
+    if hours < 48:
+        return f"~{hours}h {mins}m" if mins else f"~{hours}h"
+    days, hours = divmod(hours, 24)
+    return f"~{days}d {hours}h" if hours else f"~{days}d"
+
+
+def release_com_object(obj) -> None:
+    """Drop a COM reference so Outlook can reclaim message objects during long runs."""
+    if obj is None:
+        return
+    try:
+        del obj
+    except Exception:
+        pass
+
+
 def safe_outlook_folder_name(name: str) -> str:
     s = (name or "Folder").strip() or "Folder"
     for ch in '\\/:*?"<>|':
@@ -873,7 +911,7 @@ def count_converted_in_csv(csv_path: str) -> int:
 class EmlToPstConverter:
     def __init__(self, root):
         self.root = root
-        self.root.title("Mail Exporter")
+        self.root.title(f"Mail Exporter {APP_VERSION}")
         # Default / min size: long HU/EN labels need room; bottom bar must stay visible.
         self.root.geometry("880x720")
         self.root.minsize(780, 640)
@@ -911,6 +949,7 @@ class EmlToPstConverter:
         
         # Thread safety
         self._lock = threading.Lock()
+        self._outlook_recovery_lock = threading.Lock()
         self._is_converting = False
         self._cancel_requested = False
         self._temp_files = []
@@ -925,6 +964,7 @@ class EmlToPstConverter:
         self._dedup_sqlite_conn = None
         self._dedup_sqlite_path = None
         self._dedup_sqlite_pending = 0
+        self._eml_file_sizes: dict[str, int] = {}
         # Native OpenSharedItem staging: paths kept until batch finishes (Outlook async read).
         self._native_staging_paths = []
         self._staging_dir = None  # set per run; folder next to target PST
@@ -941,7 +981,7 @@ class EmlToPstConverter:
     def apply_language(self, _event=None):
         """Refresh all UI strings (English / Hungarian)."""
         lang = self._current_lang()
-        self.root.title(t(lang, "window_title"))
+        self.root.title(t(lang, "window_title", version=APP_VERSION))
 
         self._lf_folder.config(text=t(lang, "folder_section"))
         self._lf_pst.config(text=t(lang, "save_pst_section"))
@@ -1391,13 +1431,13 @@ class EmlToPstConverter:
             )
 
         try:
-            files, truncated = self._scan_folder_impl(
+            files, truncated, size_cache = self._scan_folder_impl(
                 folder, lang, pattern_snapshot, on_progress=on_progress
             )
             self.root.after(
                 0,
-                lambda f=files, tr=truncated, lg=lang: self._apply_scan_results(
-                    f, lg, truncated=tr
+                lambda f=files, tr=truncated, sc=size_cache, lg=lang: self._apply_scan_results(
+                    f, lg, truncated=tr, file_sizes=sc
                 ),
             )
         except Exception as e:
@@ -1425,6 +1465,7 @@ class EmlToPstConverter:
         found_files: list[str] = []
         seen: set[str] = set()
         truncated = False
+        size_cache: dict[str, int] = {}
 
         for dirpath, dirnames, filenames in os.walk(root, topdown=True):
             dirnames[:] = [
@@ -1441,20 +1482,32 @@ class EmlToPstConverter:
                     continue
                 seen.add(full)
                 found_files.append(full)
+                try:
+                    size_cache[full] = os.path.getsize(full)
+                except OSError:
+                    pass
                 if on_progress and len(found_files) % SCAN_PROGRESS_EVERY == 0:
                     on_progress(len(found_files))
                 if len(found_files) >= MAX_FILES:
                     truncated = True
                     logger.warning("File limit reached (%d)", MAX_FILES)
-                    return found_files, truncated
+                    return found_files, truncated, size_cache
 
-        return found_files, truncated
+        return found_files, truncated, size_cache
 
-    def _apply_scan_results(self, files: list[str], lang: str, *, truncated: bool = False):
+    def _apply_scan_results(
+        self,
+        files: list[str],
+        lang: str,
+        *,
+        truncated: bool = False,
+        file_sizes: dict[str, int] | None = None,
+    ):
         """Store scanned paths and refresh the preview list (full list used for export)."""
         with self._lock:
             self.eml_files = files
             self._scan_truncated = truncated
+            self._eml_file_sizes = dict(file_sizes or {})
         self._populate_file_tree_preview(lang)
         total = len(self.eml_files)
         self.status_label.config(text=t(lang, "status_found", n=total))
@@ -1531,6 +1584,10 @@ class EmlToPstConverter:
             if norm in self.eml_files:
                 return
             self.eml_files.append(norm)
+            try:
+                self._eml_file_sizes[norm] = os.path.getsize(norm)
+            except OSError:
+                self._eml_file_sizes.pop(norm, None)
             total = len(self.eml_files)
             show_row = total <= UI_PREVIEW_FILE_LIMIT
 
@@ -1716,12 +1773,7 @@ class EmlToPstConverter:
 
     @staticmethod
     def _body_looks_like_html(body: str) -> bool:
-        if not body or text_looks_binary(body):
-            return False
-        sample = body.lstrip()[:8192].lower()
-        if sample.startswith("<!doctype") or "<html" in sample or "<body" in sample:
-            return True
-        return bool(_HTML_TAG_FRAGMENT_RE.search(body))
+        return body_looks_like_html(body)
 
     @staticmethod
     def _normalize_html_body_for_outlook(body: str) -> str:
@@ -2651,7 +2703,10 @@ class EmlToPstConverter:
         logger.info("CSV: %s", csv_path)
         write_header = not append_csv or not os.path.isfile(csv_path)
         mode = "a" if append_csv and os.path.isfile(csv_path) else "w"
-        self._csv_file = open(csv_path, mode, newline="", encoding="utf-8")
+        encoding = "utf-8"
+        if mode == "w" and CSV_UTF8_BOM:
+            encoding = "utf-8-sig"
+        self._csv_file = open(csv_path, mode, newline="", encoding=encoding)
         self._csv_writer = csv.writer(self._csv_file)
         self._csv_rows_since_flush = 0
         if write_header:
@@ -4674,8 +4729,10 @@ class EmlToPstConverter:
             expected_store=pst_path or "",
         )
 
-    def _probe_outlook_application(self, outlook) -> bool:
+    def _probe_outlook_application(self, outlook, conversion_options: dict | None = None) -> bool:
         """False when the Outlook COM server is not responding."""
+        if conversion_options and conversion_options.get("_outlook_recovering"):
+            return True
         try:
             _ = outlook.Application.Version
             namespace = outlook.GetNamespace("MAPI")
@@ -4714,8 +4771,21 @@ class EmlToPstConverter:
 
         Export pauses in a loop until Outlook responds or the user cancels.
         """
+        with self._outlook_recovery_lock:
+            return self._recover_outlook_session_locked(conversion_options, lang=lang)
+
+    def _recover_outlook_session_locked(
+        self, conversion_options, *, lang: str | None = None
+    ):
         if lang is None:
             lang = conversion_options.get("lang", LANG_EN)
+        conversion_options["_outlook_recovering"] = True
+        try:
+            return self._recover_outlook_session_impl(conversion_options, lang=lang)
+        finally:
+            conversion_options["_outlook_recovering"] = False
+
+    def _recover_outlook_session_impl(self, conversion_options, *, lang: str):
         logger.warning(
             "Outlook unavailable — export paused until Outlook is healthy "
             "(max wait %ds, poll every %.0fs)",
@@ -5041,6 +5111,7 @@ class EmlToPstConverter:
         }
         consecutive_rpc_failures = 0
         last_conv_ui = [0.0]
+        conversion_options.setdefault("_export_started_mono", time.monotonic())
         logger.info(
             "Processing %d file(s); overall progress target %d",
             total,
@@ -5054,7 +5125,9 @@ class EmlToPstConverter:
                 logger.info("Cancel requested — stopping after %d/%d", i, total)
                 break
 
-            if not self._probe_outlook_application(session["outlook"]):
+            if not self._probe_outlook_application(
+                session["outlook"], conversion_options
+            ):
                 try:
                     self._refresh_outlook_session_after_failure(
                         session,
@@ -5112,6 +5185,12 @@ class EmlToPstConverter:
                         conversion_options,
                     )
                 duration = time.perf_counter() - started
+                if SLOW_FILE_WARN_SEC > 0 and duration >= SLOW_FILE_WARN_SEC:
+                    logger.warning(
+                        "Slow message (%.1fs): %s",
+                        duration,
+                        log_sanitize(file_path),
+                    )
                 if status == "converted":
                     consecutive_rpc_failures = 0
                     converted += 1
@@ -5190,11 +5269,15 @@ class EmlToPstConverter:
                 now = time.monotonic()
                 if force_ui or (now - last_conv_ui[0]) >= UI_THROTTLE_SEC:
                     last_conv_ui[0] = now
+                    started_mono = conversion_options.get("_export_started_mono") or now
+                    eta = format_export_eta(now - started_mono, overall_done, progress_total)
                     self.root.after(
                         0,
-                        lambda f=current_file, cur=overall_done, tot=progress_total, lg=lang: self.status_label.config(
-                            text=t(
-                                lg, "status_converting", name=f, cur=cur, total=tot
+                        lambda f=current_file, cur=overall_done, tot=progress_total, lg=lang, e=eta: self.status_label.config(
+                            text=(
+                                t(lg, "status_converting_eta", name=f, cur=cur, total=tot, eta=e)
+                                if e
+                                else t(lg, "status_converting", name=f, cur=cur, total=tot)
                             )
                         ),
                     )
@@ -5220,7 +5303,9 @@ class EmlToPstConverter:
             )
 
         try:
-            sz = os.path.getsize(file_path)
+            sz = self._eml_file_sizes.get(norm_path)
+            if sz is None:
+                sz = os.path.getsize(file_path)
             if sz > MAX_EML_FILE_BYTES:
                 mb = MAX_EML_FILE_BYTES // (1024 * 1024)
                 return (
@@ -6306,7 +6391,7 @@ class EmlToPstConverter:
                     return "Message was not saved in the target PST"
                 return "converted"
             finally:
-                del mail_item
+                release_com_object(mail_item)
         except Exception as e:
             return str(e)
 
@@ -6577,7 +6662,7 @@ class EmlToPstConverter:
                     outlook=conversion_options.get("_session_outlook"),
                 )
             finally:
-                del mail_item
+                release_com_object(mail_item)
 
         _com_retry(f"import {os.path.basename(import_path)}", _do_import)
 
@@ -6659,8 +6744,7 @@ class EmlToPstConverter:
         """Normalize RFC822 data to CRLF endings for better Outlook compatibility."""
         if not data:
             return data
-        normalized = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-        return b"\r\n".join(normalized.split(b"\n"))
+        return _RFC822_CRLF_NORM_RE.sub(b"\r\n", data)
 
     def _emlx_to_rfc822_bytes(self, file_path):
         """

@@ -745,7 +745,14 @@ def main() -> int:
         if not format_inspection_errors(vinsp):
             errors.append("format_inspection_errors empty")
 
-        from mail_validation import MailInspection
+        from mail_validation import (
+            ISSUE_WRONG_FOLDER,
+            MailInspection,
+            append_folder_placement_issues,
+            body_looks_like_html,
+        )
+        if body_looks_like_html("Contact <user@example.com> for help"):
+            errors.append("body_looks_like_html should not flag bare email brackets")
 
         finsp = MailInspection()
         append_folder_placement_issues(

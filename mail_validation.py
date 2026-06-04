@@ -118,13 +118,66 @@ def text_looks_binary(text: str) -> bool:
     return bytes_look_binary(encoded)
 
 
+_KNOWN_HTML_TAGS = frozenset(
+    {
+        "html",
+        "body",
+        "head",
+        "meta",
+        "div",
+        "span",
+        "p",
+        "br",
+        "table",
+        "tr",
+        "td",
+        "th",
+        "a",
+        "img",
+        "font",
+        "style",
+        "script",
+        "link",
+        "ul",
+        "ol",
+        "li",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "center",
+        "blockquote",
+        "pre",
+        "hr",
+        "strong",
+        "em",
+        "b",
+        "i",
+        "u",
+    }
+)
+
+
+def _html_tag_name_from_match(tag_text: str) -> str | None:
+    inner = tag_text.strip("<>/ \t").split(None, 1)[0].lower()
+    if not inner or inner in ("http", "https", "mailto", "ftp"):
+        return None
+    return inner.split(":", 1)[0]
+
+
 def body_looks_like_html(body: str) -> bool:
     if not body or text_looks_binary(body):
         return False
     sample = body.lstrip()[:8192].lower()
     if sample.startswith("<!doctype") or "<html" in sample or "<body" in sample:
         return True
-    return bool(_HTML_TAG_FRAGMENT_RE.search(body))
+    for match in _HTML_TAG_FRAGMENT_RE.finditer(body[:8192]):
+        name = _html_tag_name_from_match(match.group(0))
+        if name in _KNOWN_HTML_TAGS:
+            return True
+    return False
 
 
 def html_stored_as_plain_text(plain_body: str, html_body: str) -> bool:

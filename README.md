@@ -103,6 +103,38 @@ Use the **Live Mail Folder** button to scan it automatically.
 - Large mailboxes take time; speed is limited by Outlook, not this app.
 - For Exchange import, messages appear in the folder you specify (default: `Imported EML`) and sync per your Outlook/Exchange settings.
 
+## Troubleshooting
+
+| Symptom | What to do |
+|--------|------------|
+| Export stops with “waiting for Outlook” | Restart Outlook; export resumes when COM reconnects (up to `EML2PST_OUTLOOK_WAIT_MAX`, default 1 hour). |
+| **None** sender/subject or raw `<br/>` in PST | Built with v1.0.2+; delete bad PST items (or new PST) and re-import — resume does not rewrite old items. |
+| Blank rows after resume | Keep `export_results.csv` and `dedup_state.sqlite3` in the same folder as the PST; check **Resume from prior export log**. |
+| “Access is denied” / exe quarantined | See [If the exe will not run](#if-the-exe-will-not-run-access-is-denied-or-disappears) above. |
+| 32-bit vs 64-bit mismatch | Use `MailExporter_x32.exe` with 32-bit Outlook (typical on older VMs). |
+| Very slow single messages | Log warns after `EML2PST_SLOW_FILE_SEC` (default 120s); check huge attachments or damaged `.eml`. |
+| Antivirus blocks build | `python build_exe.py --onedir` and run from the folder bundle. |
+
+## Unicode and CSV export
+
+- Message text uses UTF-8 end-to-end where possible (RFC 2047 decoding, HTML `charset=utf-8`).
+- **`export_results.csv`** is UTF-8 with BOM on a **new** export so Excel shows Hungarian characters correctly.
+- To write plain UTF-8 without BOM: set `EML2PST_CSV_BOM=0` before starting.
+- Paths and detail fields are sanitized for Excel formula injection (`csv_sanitize`).
+
+## Environment variables (common)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `EML2PST_VALIDATE_IMPORT` | `1` | Per-message PST quality checks |
+| `EML2PST_OUTLOOK_WAIT_MAX` | `3600` | Seconds to wait for Outlook after crash |
+| `EML2PST_PST_CHUNK_SIZE` | `100` | Batch size for PST import |
+| `EML2PST_DEDUP_BACKEND` | `auto` | `sqlite` for large jobs |
+| `EML2PST_CSV_BOM` | `1` | UTF-8 BOM on new CSV |
+| `EML2PST_SLOW_FILE_SEC` | `120` | Log warning if one file exceeds this |
+
+See `CHANGELOG.md` for the full v1.0.2 list.
+
 ## License
 
 Open source — internal company use.

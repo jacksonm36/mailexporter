@@ -40,7 +40,7 @@ def lang_from_display(name: str) -> str:
 
 STRINGS: dict[str, dict[str, str]] = {
     LANG_EN: {
-        "window_title": "Mail Exporter",
+        "window_title": "Mail Exporter {version}",
         "folder_section": "Add Folder Having *.eml / *.emlx Files",
         "add_files": "Add Files",
         "wlm_preset": "Live Mail Folder",
@@ -154,6 +154,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "status_chain_import": "Chain {cur}/{total}: importing batch to chunk PST...",
         "status_chain_merge": "Chain {cur}/{total}: merging chunk into final PST...",
         "status_converting": "Converting: {name} ({cur}/{total})",
+        "status_converting_eta": "Converting: {name} ({cur}/{total}) — ETA {eta}",
         "status_complete": "Conversion Complete",
         "title_complete": "Complete",
         "msg_complete": (
@@ -214,7 +215,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "note_log_saved": "\n\nLog file: {path}",
     },
     LANG_HU: {
-        "window_title": "Mail Exporter",
+        "window_title": "Mail Exporter {version}",
         "folder_section": "Mappa hozzáadása *.eml / *.emlx fájlokkal",
         "add_files": "Fájlok hozzáadása",
         "wlm_preset": "Live Mail mappa",
@@ -327,6 +328,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "status_chain_import": "Lánc {cur}/{total}: köteg importálása ideiglenes PST-be...",
         "status_chain_merge": "Lánc {cur}/{total}: ideiglenes PST egyesítése a végsőbe...",
         "status_converting": "Konvertálás: {name} ({cur}/{total})",
+        "status_converting_eta": "Konvertálás: {name} ({cur}/{total}) — hátralévő: {eta}",
         "status_complete": "Konvertálás kész",
         "title_complete": "Kész",
         "msg_complete": (
