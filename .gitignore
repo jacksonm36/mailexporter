@@ -1,0 +1,42 @@
+# Email files - do not include in repo
+emls/
+*.eml
+*.emlx
+*.pst
+*.mbox
+
+# Build artifacts (release assets uploaded separately)
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs / test run output
+export.log
+export_log.txt
+export_results.csv
+test/export_log.txt
+test/export_results.csv

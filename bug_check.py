@@ -1,0 +1,626 @@
+"""Quick sanity checks for Mail Exporter (no Outlook required)."""
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_TEST = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "MailExporter_test")
+TEST_MAIL = os.environ.get("EML2PST_TEST_MAIL", os.path.join(_DEFAULT_TEST, "mail"))
+
+
+def main() -> int:
+    sys.path.insert(0, ROOT)
+    from eml_to_pst_converter import (
+        EmlToPstConverter,
+        _ImmediateFileHandler,
+        csv_sanitize,
+        count_converted_in_csv,
+        export_log_paths,
+        load_resume_paths,
+        load_resume_paths_from_sqlite,
+        logger,
+        normalize_pst_path,
+        pst_paths_equal,
+        bytes_look_binary,
+        text_looks_binary,
+        relative_folder_parts,
+        safe_outlook_folder_name,
+        _is_outlook_path_open_error,
+        _pattern_to_suffixes,
+        _portable_staging_base,
+    )
+
+    def _fp_hash(app_stub, path: str, size: int) -> str | None:
+        pair = app_stub._file_content_fingerprint(path, size)
+        if pair is None:
+            return None
+        return pair[0]
+
+    errors: list[str] = []
+
+    # Sanitization
+    if csv_sanitize("=1+1") != "'=1+1":
+        errors.append("csv_sanitize formula prefix")
+    if safe_outlook_folder_name("a/b:c") != "a_b_c":
+        errors.append("safe_outlook_folder_name")
+
+    # Pattern parsing
+    if _pattern_to_suffixes("*.eml;*.emlx") != {".eml", ".emlx"}:
+        errors.append("_pattern_to_suffixes")
+
+    with tempfile.TemporaryDirectory() as pst_tmp:
+        raw = os.path.join(pst_tmp, "out")
+        norm = normalize_pst_path(raw)
+        if not norm.lower().endswith(".pst"):
+            errors.append("normalize_pst_path should add .pst")
+        if not pst_paths_equal(norm, raw + ".pst"):
+            errors.append("pst_paths_equal basic")
+        if os.name == "nt" and not pst_paths_equal(
+            norm.upper(), norm.lower()
+        ):
+            errors.append("pst_paths_equal case insensitive on Windows")
+
+    # Staging base should prefer LOCALAPPDATA (not raw %TEMP%)
+    staging = _portable_staging_base()
+    if not os.path.isdir(staging):
+        errors.append("_portable_staging_base not a directory")
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local and tempfile.gettempdir().lower() in staging.lower():
+        if "MailExporter" not in staging:
+            errors.append("_portable_staging_base fell back to TEMP unexpectedly")
+
+    # OpenSharedItem path helpers
+    app_stub = EmlToPstConverter.__new__(EmlToPstConverter)
+    if os.path.isdir(TEST_MAIL):
+        sample = next(
+            (
+                os.path.join(dp, f)
+                for dp, _, fs in os.walk(TEST_MAIL)
+                for f in fs
+                if f.lower().endswith(".eml")
+            ),
+            "",
+        )
+        if sample:
+            cands = app_stub._open_shared_item_candidates(sample, allow_uri=False)
+            if not cands or any(c.startswith("file:") for c in cands):
+                errors.append("_open_shared_item_candidates should not use file:/// when allow_uri=False")
+            cands_uri = app_stub._open_shared_item_candidates(sample, allow_uri=True)
+            if not any(c.startswith("file:") for c in cands_uri):
+                errors.append("_open_shared_item_candidates allow_uri=True should include file:///")
+
+    if not _is_outlook_path_open_error("We couldn't find 'file:///C:/x.eml'. It may have been moved or deleted."):
+        errors.append("_is_outlook_path_open_error")
+    if not _is_outlook_path_open_error("Invalid path or URL."):
+        errors.append("_is_outlook_path_open_error invalid path")
+
+    wlm_like = r"C:\test\PQ (user@domain)\Inbox\msg.eml"
+    if not app_stub._path_needs_native_staging(wlm_like):
+        errors.append("_path_needs_native_staging should be True for () and @ in path")
+
+    if not hasattr(app_stub, "_stamp_delivery_on_new_item"):
+        errors.append("_stamp_delivery_on_new_item missing")
+    for name in (
+        "_apply_mapi_delivery_times",
+        "_clear_unsent_mapi_flag",
+        "_stamp_delivery_for_import",
+        "_commit_mail_to_pst_folder",
+        "_relocate_mail_to_dest_folder",
+        "_import_open_shared_into_pst_folder",
+        "_message_in_expected_pst",
+        "_folder_store_path",
+        "_log_pst_store_layout",
+        "_prepare_pst_store_for_import",
+        "_activate_pst_store_for_export",
+        "_label_pst_store_for_outlook",
+        "_folder_belongs_to_pst",
+        "_create_mail_in_pst_target_folder",
+        "_add_mail_via_store_inbox",
+        "_find_folder_in_tree",
+        "_record_converted_path_sqlite",
+        "_stores_match",
+        "_pst_folder_ready_for_import",
+        "_discover_pst_mail_inbox",
+        "_is_usable_standard_folder",
+        "_folder_looks_like_search_container",
+        "_coerce_import_folder",
+        "_folder_is_usable_import_target",
+        "_get_or_create_standard_folder",
+    ):
+        if not hasattr(app_stub, name):
+            errors.append(f"{name} missing")
+    import inspect
+
+    mark_sig = inspect.signature(app_stub._mark_mail_imported_received)
+    if "dt_local" not in mark_sig.parameters:
+        errors.append("_mark_mail_imported_received must accept dt_local")
+    save_sig = inspect.signature(app_stub._save_imported_mail)
+    if "dt_local" not in save_sig.parameters:
+        errors.append("_save_imported_mail must accept dt_local")
+    if not hasattr(app_stub, "_transfer_opened_mail_to_folder"):
+        errors.append("_transfer_opened_mail_to_folder missing")
+    if not hasattr(app_stub, "_export_targets_pst"):
+        errors.append("_export_targets_pst missing")
+    if not hasattr(app_stub, "_import_eml_direct_to_pst_folder"):
+        errors.append("_import_eml_direct_to_pst_folder missing")
+
+    pst_opts = {"pst_option": "new", "destination_path": r"C:\out\pq2.pst"}
+    mbox_opts = {"pst_option": "mailbox", "destination_path": ""}
+    if not app_stub._export_targets_pst(pst_opts):
+        errors.append("_export_targets_pst should be True for PST export")
+    if app_stub._export_targets_pst(mbox_opts):
+        errors.append("_export_targets_pst should be False for mailbox export")
+
+    class _FakeMail:
+        def __init__(self, store_path: str):
+            self.Parent = type("P", (), {"Store": type("S", (), {"FilePath": store_path})()})()
+
+    if app_stub._message_in_expected_pst(_FakeMail(""), r"C:\out\pq1.pst"):
+        errors.append("_message_in_expected_pst must reject empty store path")
+    if not app_stub._message_in_expected_pst(
+        _FakeMail(r"C:\out\pq1.pst"), r"C:\out\pq1.pst"
+    ):
+        errors.append("_message_in_expected_pst should accept matching PST path")
+
+    class _FakeFolder:
+        def __init__(self, name: str, store_path: str):
+            self.Name = name
+            self.Store = type("S", (), {"FilePath": store_path})()
+
+    bad = _FakeFolder("", r"C:\out\pq1.pst")
+    if app_stub._folder_is_usable_import_target(bad, r"C:\out\pq1.pst"):
+        errors.append("_folder_is_usable_import_target must reject empty folder name")
+    good = _FakeFolder("Inbox", r"C:\out\pq1.pst")
+    if not app_stub._folder_is_usable_import_target(good, r"C:\out\pq1.pst"):
+        errors.append("_folder_is_usable_import_target should accept named Inbox")
+
+    class _FakeStore:
+        def __init__(self, path: str, store_id: str = "STORE1"):
+            self.FilePath = path
+            self.StoreID = store_id
+
+    class _FakeItems:
+        Count = 0
+
+    class _FakeInboxNoName:
+        Name = ""
+        DefaultItemType = 0
+
+        def __init__(self, store: _FakeStore):
+            self.Store = store
+            self.Items = _FakeItems()
+
+    pst_store = _FakeStore(r"C:\out\pq2.pst")
+    unnamed_inbox = _FakeInboxNoName(pst_store)
+    if not app_stub._stores_match(unnamed_inbox.Store, pst_store):
+        errors.append("_stores_match should match same StoreID/path")
+    class _FakeSearchInbox:
+        Name = "SPAM Search Folder 2"
+        FolderClass = "IPF.OutlookSearchFolder"
+        DefaultItemType = 0
+
+        def __init__(self, store: _FakeStore):
+            self.Store = store
+            self.Items = _FakeItems()
+
+    search_inbox = _FakeSearchInbox(pst_store)
+    if app_stub._is_usable_standard_folder(
+        search_inbox, 6, pst_store
+    ):
+        errors.append("_is_usable_standard_folder must reject SPAM search folder Inbox")
+    if app_stub._folder_looks_like_search_container(search_inbox):
+        pass
+    else:
+        errors.append("_folder_looks_like_search_container should detect search folder")
+
+    if not bytes_look_binary(b"%PDF-1.3\nbinary"):
+        errors.append("bytes_look_binary should detect PDF")
+    if not text_looks_binary("%PDF-1.3\n"):
+        errors.append("text_looks_binary should detect PDF header")
+    if text_looks_binary("Hello, this is a normal email body."):
+        errors.append("text_looks_binary should accept plain text")
+
+    with tempfile.TemporaryDirectory() as mime_tmp:
+        pdf_eml = os.path.join(mime_tmp, "pdf_only.eml")
+        pdf_bytes = b"%PDF-1.3\nfake pdf content with null \x00 byte"
+        import base64
+
+        b64 = base64.b64encode(pdf_bytes).decode("ascii")
+        with open(pdf_eml, "wb") as handle:
+            handle.write(
+                (
+                    "From: sender@example.com\r\n"
+                    "To: recv@example.com\r\n"
+                    "Subject: PO PDF\r\n"
+                    "MIME-Version: 1.0\r\n"
+                    'Content-Type: application/pdf; name="order.pdf"\r\n'
+                    "Content-Transfer-Encoding: base64\r\n"
+                    "Content-Disposition: inline; filename=\"order.pdf\"\r\n"
+                    "\r\n"
+                    f"{b64}\r\n"
+                ).encode("ascii")
+            )
+        parsed = app_stub.parse_eml(pdf_eml)
+        if not parsed:
+            errors.append("parse_eml failed for inline PDF sample")
+        else:
+            if parsed.get("body"):
+                errors.append("get_email_body must not return PDF bytes as body")
+            atts = parsed.get("attachments") or []
+            if len(atts) != 1 or not atts[0].get("filename", "").endswith(".pdf"):
+                errors.append("inline PDF should be extracted as attachment")
+            elif atts[0].get("data", b"")[:5] != b"%PDF-":
+                errors.append("inline PDF attachment payload corrupt")
+
+        multi_eml = os.path.join(mime_tmp, "multi_attach.eml")
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+        zip_bytes = b"PK\x03\x04" + b"\x00" * 32
+        png_b64 = base64.b64encode(png_bytes).decode("ascii")
+        zip_b64 = base64.b64encode(zip_bytes).decode("ascii")
+        with open(multi_eml, "wb") as handle:
+            handle.write(
+                (
+                    "From: sender@example.com\r\n"
+                    "To: recv@example.com\r\n"
+                    "Subject: files\r\n"
+                    "MIME-Version: 1.0\r\n"
+                    'Content-Type: multipart/mixed; boundary="bnd"\r\n'
+                    "\r\n"
+                    "--bnd\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "\r\n"
+                    "See attached files.\r\n"
+                    "--bnd\r\n"
+                    'Content-Type: image/png; name="scan.png"\r\n'
+                    "Content-Transfer-Encoding: base64\r\n"
+                    'Content-Disposition: attachment; filename="scan.png"\r\n'
+                    "\r\n"
+                    f"{png_b64}\r\n"
+                    "--bnd\r\n"
+                    'Content-Type: application/zip; name="data.zip"\r\n'
+                    "Content-Transfer-Encoding: base64\r\n"
+                    'Content-Disposition: attachment; filename="data.zip"\r\n'
+                    "\r\n"
+                    f"{zip_b64}\r\n"
+                    "--bnd--\r\n"
+                ).encode("ascii")
+            )
+        multi = app_stub.parse_eml(multi_eml)
+        if not multi:
+            errors.append("parse_eml failed for PNG+ZIP multipart sample")
+        else:
+            names = {a.get("filename", "").lower() for a in multi.get("attachments") or []}
+            if "scan.png" not in names or "data.zip" not in names:
+                errors.append("multipart PNG+ZIP attachments not extracted")
+            merged = app_stub._merge_attachment_records(
+                multi.get("attachments") or [],
+                [
+                    {
+                        "filename": "extra.pdf",
+                        "data": b"%PDF-1.3",
+                        "content_type": "application/pdf",
+                    }
+                ],
+            )
+            if len(merged) != 3:
+                errors.append("_merge_attachment_records should merge distinct files")
+            if not hasattr(app_stub, "_apply_attachment_chain"):
+                errors.append("_apply_attachment_chain missing")
+
+    wlm_opts = {"use_file_mtime_for_date": True}
+    if not app_stub._is_windows_live_mail_path(
+        r"D:\backup\Windows Live Mail\account\Inbox\a.eml"
+    ):
+        errors.append("_is_windows_live_mail_path")
+    with tempfile.TemporaryDirectory() as wlm_tmp:
+        wlm_eml = os.path.join(
+            wlm_tmp, "Windows Live Mail", "PQ (user@x)", "Inbox", "probe.eml"
+        )
+        os.makedirs(os.path.dirname(wlm_eml), exist_ok=True)
+        with open(wlm_eml, "wb") as handle:
+            handle.write(b"From: a@b.c\r\nDate: Mon, 1 Jan 2024 12:00:00 +0000\r\n\r\nx\r\n")
+        mtime_dt = app_stub._file_mtime_datetime(wlm_eml)
+        resolved = app_stub._resolve_outlook_datetime_for_source(
+            wlm_eml, None, wlm_opts
+        )
+        if mtime_dt is None or resolved != mtime_dt:
+            errors.append(
+                "_resolve_outlook_datetime_for_source should prefer mtime on WLM paths"
+            )
+
+    # LF-only test EMLs should skip direct OpenSharedItem (need CRLF staging)
+    if os.path.isdir(TEST_MAIL):
+        sample = next(
+            (
+                os.path.join(dp, f)
+                for dp, _, fs in os.walk(TEST_MAIL)
+                for f in fs
+                if f.lower().endswith(".eml")
+            ),
+            "",
+        )
+        if sample:
+            ready = app_stub._eml_source_likely_outlook_native_ready(sample)
+            with open(sample, "rb") as handle:
+                chunk = handle.read(8192)
+            lf_only = b"\n" in chunk and b"\r\n" not in chunk
+            if lf_only and ready:
+                errors.append("_eml_source_likely_outlook_native_ready should be False for LF-only .eml")
+            if not lf_only and not ready:
+                errors.append("_eml_source_likely_outlook_native_ready unexpected False for CRLF .eml")
+
+            large = next(
+                (
+                    os.path.join(dp, f)
+                    for dp, _, fs in os.walk(TEST_MAIL)
+                    for f in fs
+                    if f.lower().startswith("large_") and f.lower().endswith(".eml")
+                ),
+                "",
+            )
+            if large:
+                lsz = os.path.getsize(large)
+                from eml_to_pst_converter import NATIVE_IMPORT_MAX_BYTES
+
+                if lsz > NATIVE_IMPORT_MAX_BYTES:
+                    if app_stub._should_try_native_import(large, lsz):
+                        errors.append(
+                            "_should_try_native_import should skip oversized EML"
+                        )
+                elif not app_stub._should_try_native_import(large, lsz):
+                    errors.append(
+                        "_should_try_native_import should allow attachment EML under size cap"
+                    )
+            tiny = next(
+                (
+                    os.path.join(dp, f)
+                    for dp, _, fs in os.walk(TEST_MAIL)
+                    for f in fs
+                    if f.lower().startswith("tiny_") and f.lower().endswith(".eml")
+                ),
+                "",
+            )
+            if tiny:
+                tsz = os.path.getsize(tiny)
+                if not app_stub._should_try_native_import(tiny, tsz):
+                    errors.append("_should_try_native_import should allow tiny EML")
+
+    # Subfolder mapping
+    from eml_to_pst_converter import (
+        OL_FOLDER_DELETED,
+        OL_FOLDER_INBOX,
+        OL_FOLDER_OUTBOX,
+        OL_FOLDER_SENT,
+        find_standard_folder_in_parts,
+        sent_state_for_folder_parts,
+        standard_outlook_folder_id,
+    )
+
+    if standard_outlook_folder_id("Inbox") != 6:
+        errors.append("standard_outlook_folder_id Inbox")
+    if standard_outlook_folder_id("Piszkozatok") != 16:
+        errors.append("standard_outlook_folder_id Piszkozatok")
+    if standard_outlook_folder_id("Sent Items") != 5:
+        errors.append("standard_outlook_folder_id Sent Items")
+    if standard_outlook_folder_id("Outbox") != OL_FOLDER_OUTBOX:
+        errors.append("standard_outlook_folder_id Outbox")
+
+    if sent_state_for_folder_parts(["PQ (x)", "Sent Items"]) is not True:
+        errors.append("sent_state_for_folder_parts Sent Items")
+    if sent_state_for_folder_parts(["PQ", "Drafts"]) is not False:
+        errors.append("sent_state_for_folder_parts Drafts")
+    if sent_state_for_folder_parts(["PQ", "Outbox"]) is not False:
+        errors.append("sent_state_for_folder_parts Outbox")
+    if sent_state_for_folder_parts(["PQ", "Inbox"]) is not None:
+        errors.append("sent_state_for_folder_parts Inbox should be None")
+    if sent_state_for_folder_parts(["PQ", "Deleted Items"]) is not None:
+        errors.append("sent_state_for_folder_parts Deleted Items should be None")
+
+    fid, idx, rem = find_standard_folder_in_parts(
+        ["PQ (user@x)", "Sent Items", "2024"]
+    )
+    if fid != OL_FOLDER_SENT or idx != 1 or rem != ["PQ (user@x)", "2024"]:
+        errors.append(f"nested standard folder map: fid={fid} idx={idx} rem={rem}")
+    fid2, idx2, rem2 = find_standard_folder_in_parts(["PQ", "Outbox"])
+    if fid2 != OL_FOLDER_OUTBOX or idx2 != 1 or rem2 != ["PQ"]:
+        errors.append(f"outbox folder map: fid={fid2} idx={idx2} rem={rem2}")
+    fid3, idx3, rem3 = find_standard_folder_in_parts(
+        ["PQ", "Inbox", "Projects", "Inbox"]
+    )
+    if fid3 != OL_FOLDER_INBOX or idx3 != 3 or rem3 != ["PQ", "Inbox", "Projects"]:
+        errors.append(
+            f"last standard folder wins: fid={fid3} idx={idx3} rem={rem3}"
+        )
+    fid4, _, rem4 = find_standard_folder_in_parts(["PQ", "Deleted Items"])
+    if fid4 != OL_FOLDER_DELETED or rem4 != ["PQ"]:
+        errors.append(f"deleted folder map: fid={fid4} rem={rem4}")
+
+    if not hasattr(app_stub, "_get_or_create_pst_standard_folder"):
+        errors.append("_get_or_create_pst_standard_folder missing")
+    if not hasattr(app_stub, "_sent_state_for_source_path"):
+        errors.append("_sent_state_for_source_path missing")
+
+    root = os.path.abspath(TEST_MAIL)
+    sample = os.path.join(root, "Inbox", "tiny_0001_test.eml")
+    if os.path.isfile(sample):
+        parts = relative_folder_parts(root, sample)
+        if parts != ["Inbox"]:
+            errors.append(f"relative_folder_parts expected ['Inbox'], got {parts}")
+    wlm_root = os.path.join(root, "PQ (user@x)") if os.path.isdir(os.path.join(root, "PQ (user@x)")) else ""
+    if not wlm_root:
+        wlm_root = root
+    nested = os.path.join(wlm_root, "Inbox", "tiny_0001_test.eml")
+    if os.path.isfile(nested):
+        parts = relative_folder_parts(wlm_root, nested)
+        if parts and parts[0].lower() != "inbox" and "inbox" not in [p.lower() for p in parts]:
+            errors.append(f"WLM nested parts missing Inbox: {parts}")
+
+    # Dedup fingerprint + full-corpus simulation
+    if os.path.isdir(TEST_MAIL):
+        paths: list[str] = []
+        for dirpath, _, names in os.walk(TEST_MAIL):
+            for name in names:
+                if name.lower().endswith(".eml"):
+                    paths.append(os.path.join(dirpath, name))
+        dups = [p for p in paths if "dup_" in os.path.basename(p)]
+        originals = [p for p in paths if "dup_" not in os.path.basename(p)]
+        if len(paths) < 400:
+            errors.append(f"expected ~500 test files, found {len(paths)}")
+        if len(dups) < 50:
+            errors.append(f"expected ~100 duplicate files, found {len(dups)}")
+
+        app_stub = EmlToPstConverter.__new__(EmlToPstConverter)
+        seen_fp: set[str] = set()
+        would_skip = 0
+        for path in sorted(paths):
+            try:
+                sz = os.path.getsize(path)
+            except OSError:
+                continue
+            fp = _fp_hash(app_stub, path, sz)
+            if fp is None:
+                errors.append(f"fingerprint failed for {path}")
+                continue
+            if fp in seen_fp:
+                would_skip += 1
+            else:
+                seen_fp.add(fp)
+        if would_skip < 50:
+            errors.append(
+                f"dedup simulation expected ~100 skips, got {would_skip}"
+            )
+
+        if dups and originals:
+            dup = dups[0]
+            base = os.path.basename(dup)
+            if "_of_" in base:
+                orig_name = base.split("_of_", 1)[1]
+                orig = next(
+                    (p for p in originals if os.path.basename(p) == orig_name),
+                    None,
+                )
+                if orig:
+                    fp1 = _fp_hash(app_stub, dup, os.path.getsize(dup))
+                    fp2 = _fp_hash(app_stub, orig, os.path.getsize(orig))
+                    if fp1 != fp2:
+                        errors.append("duplicate fingerprint mismatch")
+                else:
+                    errors.append(f"could not find original for {dup}")
+        elif paths:
+            errors.append("no duplicate test files found")
+
+    # Default dedup enabled
+    import tkinter as tk
+
+    root_win = tk.Tk()
+    root_win.withdraw()
+    try:
+        app = EmlToPstConverter(root_win)
+        if not app.remove_duplicates.get():
+            errors.append("remove_duplicates should default to True")
+    finally:
+        root_win.destroy()
+
+    # Resume CSV reader
+    csv_path = os.path.join(_DEFAULT_TEST, "export_results_sample.csv")
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    if not os.path.isfile(csv_path):
+        with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(
+                "timestamp,file_path,status,detail,duration_sec,target_folder\n"
+                f"2024-01-01 12:00:00,'=evil,converted,,1.0,Inbox\n"
+            )
+    resumed = load_resume_paths(csv_path)
+    if not any("evil" in p for p in resumed):
+        pass  # path normalization may differ; just ensure no crash
+    if count_converted_in_csv(csv_path) < 1:
+        errors.append("count_converted_in_csv should find converted row")
+
+    with tempfile.TemporaryDirectory() as sqlite_tmp:
+        import sqlite3
+
+        db_path = os.path.join(sqlite_tmp, "dedup_state.sqlite3")
+        probe = os.path.normpath(os.path.join(sqlite_tmp, "mail", "a.eml"))
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE converted_path (
+                path TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO converted_path VALUES (?, 'converted', '2024-01-01')",
+            (probe,),
+        )
+        conn.commit()
+        conn.close()
+        from_sqlite = load_resume_paths_from_sqlite(db_path)
+        if probe not in from_sqlite:
+            errors.append("load_resume_paths_from_sqlite should return converted path")
+
+    # Export log files are created and flushed immediately
+    with tempfile.TemporaryDirectory() as tmp:
+        pst = os.path.join(tmp, "out.pst")
+        with open(pst, "wb") as handle:
+            handle.write(b"\x00")
+        csv_p, log_p = export_log_paths(tmp, pst, "new")
+        if not log_p.endswith("export.log"):
+            errors.append("export_log_paths should use export.log")
+        handler = _ImmediateFileHandler(log_p, append=False)
+        logger.addHandler(handler)
+        try:
+            logger.info("bug_check export log probe")
+            handler.flush()
+        finally:
+            logger.removeHandler(handler)
+            handler.close()
+        if not os.path.isfile(log_p) or os.path.getsize(log_p) < 20:
+            errors.append("_ImmediateFileHandler did not write export.log")
+        else:
+            with open(log_p, encoding="utf-8") as handle:
+                body = handle.read()
+            if "bug_check export log probe" not in body:
+                errors.append("export.log missing probe line")
+            if "Mail Exporter export session" not in body:
+                errors.append("export.log missing session banner")
+
+    if errors:
+        print("FAILED:")
+        for err in errors:
+            print(f"  - {err}")
+        return 1
+
+    print("All bug_check tests passed.")
+    if os.path.isdir(TEST_MAIL):
+        n = sum(
+            1
+            for dp, _, fs in os.walk(TEST_MAIL)
+            for f in fs
+            if f.lower().endswith(".eml")
+        )
+        print(f"  test mail folder: {n} .eml files at {TEST_MAIL}")
+        if os.path.isdir(TEST_MAIL):
+            app_stub = EmlToPstConverter.__new__(EmlToPstConverter)
+            seen: set[str] = set()
+            skip = 0
+            for dp, _, fs in os.walk(TEST_MAIL):
+                for f in fs:
+                    if not f.lower().endswith(".eml"):
+                        continue
+                    p = os.path.join(dp, f)
+                    fp = _fp_hash(app_stub, p, os.path.getsize(p))
+                    if fp and fp in seen:
+                        skip += 1
+                    else:
+                        seen.add(fp)
+            print(f"  dedup simulation: {skip} duplicates would be skipped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

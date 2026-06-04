@@ -1,0 +1,15 @@
+500 test EML files (400 unique + 100 byte-identical duplicates) are stored at:
+
+  %LOCALAPPDATA%\MailExporter_test\mail
+
+Subfolders: Inbox, Sent, Archive, Drafts
+Sizes: tiny / small / medium / large (with attachments up to ~400 KB)
+
+Regenerate:
+  python generate_test_emls.py
+
+Quick 15-file set:
+  %LOCALAPPDATA%\MailExporter_test\quick
+
+Sanity check (no Outlook):
+  python bug_check.py
