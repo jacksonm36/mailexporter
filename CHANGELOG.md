@@ -27,6 +27,7 @@
 ### Fixed
 - **SQLite + COM pipeline:** thread-safe dedup DB (`check_same_thread=False` + lock) when prep/import run on worker threads.
 - **Path security:** WLM folders like `\00014461-...` no longer rejected as false `\\0` null-byte matches.
+- **Blank PST sender:** MAPI sender properties after `Sent=True`; PST import prefers staged OpenSharedItem; delete bad item before rebuild (avoids duplicate rows).
 - **Memory-mapped I/O** for large `.eml` files (`mmap_processor.py`, default from 4 MB via `EML2PST_MMAP_THRESHOLD_MB`): parsing, SHA-256 dedup, fingerprint head/tail, and streamed CRLF staging without loading the full file into RAM.
 - SQLite dedup for large mailboxes (default from 200k files).
 - File sizes cached at scan time (avoids repeated `stat()` during export).

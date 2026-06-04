@@ -206,6 +206,11 @@ _OUTLOOK_MAPI_TIME_URLS = (
     "http://schemas.microsoft.com/mapi/proptag/0x30080040",  # PR_LAST_MODIFICATION_TIME
 )
 _OUTLOOK_MAPI_MESSAGE_FLAGS = "http://schemas.microsoft.com/mapi/proptag/0x0E070003"
+_OUTLOOK_MAPI_SENDER_NAME = "http://schemas.microsoft.com/mapi/proptag/0x0C1A001F"
+_OUTLOOK_MAPI_SENDER_EMAIL = "http://schemas.microsoft.com/mapi/proptag/0x0C1F001E"
+_OUTLOOK_MAPI_SENDER_ADDRTYPE = "http://schemas.microsoft.com/mapi/proptag/0x0C1E001E"
+_OUTLOOK_MAPI_SENT_REP_NAME = "http://schemas.microsoft.com/mapi/proptag/0x0042001F"
+_OUTLOOK_MAPI_SENT_REP_EMAIL = "http://schemas.microsoft.com/mapi/proptag/0x0065001F"
 _MSGFLAG_UNSENT = 0x0008
 
 # Folder names
@@ -1992,6 +1997,77 @@ class EmlToPstConverter:
                         pass
         except (AttributeError, TypeError) as e:
             logger.debug("Could not set sender properties: %s", e)
+        self._apply_sender_mapi_properties(
+            mail, display or addr or from_raw, addr, is_sent_message=is_sent_message
+        )
+
+    def _apply_sender_mapi_properties(
+        self,
+        mail,
+        display_name: str,
+        email_addr: str,
+        *,
+        is_sent_message: bool,
+    ) -> None:
+        """
+        Set sender via MAPI — required on many Outlook builds after Sent=True / Save.
+        OM SenderName/SenderEmailAddress alone often stay blank in the message list.
+        """
+        display_name = (display_name or "").strip()
+        email_addr = (email_addr or "").strip()
+        if not display_name and not email_addr:
+            return
+        try:
+            pa = mail.PropertyAccessor
+        except Exception as e:
+            logger.debug("Sender MAPI unavailable: %s", e)
+            return
+        if is_sent_message:
+            props = (
+                (_OUTLOOK_MAPI_SENT_REP_NAME, display_name),
+                (_OUTLOOK_MAPI_SENT_REP_EMAIL, email_addr),
+            )
+        else:
+            props = (
+                (_OUTLOOK_MAPI_SENDER_NAME, display_name),
+                (_OUTLOOK_MAPI_SENDER_EMAIL, email_addr),
+            )
+        for url, value in props:
+            if not value:
+                continue
+            try:
+                pa.SetProperty(url, value)
+            except Exception as e:
+                logger.debug("SetProperty sender %s: %s", url, e)
+        if email_addr and not is_sent_message:
+            try:
+                pa.SetProperty(_OUTLOOK_MAPI_SENDER_ADDRTYPE, "SMTP")
+            except Exception:
+                pass
+
+    def _reapply_sender_from_email_data(
+        self,
+        mail,
+        email_data: dict | None,
+        source_file_path: str | None,
+        conversion_options: dict,
+    ) -> None:
+        """Re-apply sender after Received/Sent flags (Outlook may clear list fields)."""
+        if not email_data:
+            return
+        from_raw = (email_data.get("from") or "").strip()
+        if not from_raw and email_data.get("message") is not None:
+            from_raw = self._resolve_from_header(email_data["message"])
+        if not from_raw:
+            return
+        sent_state = None
+        if source_file_path:
+            sent_state = self._sent_state_for_source_path(
+                source_file_path, conversion_options
+            )
+        self._apply_sender_from_parsed_from(
+            mail, from_raw, is_sent_message=(sent_state is True)
+        )
 
     def _copy_sender_from_mail_item(
         self, dest_mail, source_mail, *, is_sent_message: bool
@@ -4656,6 +4732,9 @@ class EmlToPstConverter:
         self._apply_parsed_display_fields(
             mail, email_data, file_path, conversion_options
         )
+        self._reapply_sender_from_email_data(
+            mail, email_data, file_path, conversion_options
+        )
         self._apply_attachment_chain(
             mail,
             email_data=email_data,
@@ -4734,15 +4813,16 @@ class EmlToPstConverter:
             return "converted"
 
         detail = format_inspection_errors(inspection)
+        try:
+            mail.Delete()
+        except Exception as e:
+            logger.debug("Delete invalid import before rebuild: %s", e)
+        release_com_object(mail)
         if (
             not from_validation_rebuild
             and self._export_targets_pst(conversion_options)
             and outlook is not None
         ):
-            try:
-                mail.Delete()
-            except Exception as e:
-                logger.debug("Delete invalid PST import: %s", e)
             rebuild_opts = dict(conversion_options)
             rebuild_opts["_skip_import_validation"] = False
             rebuild = self._process_single_email_manual_fallback(
@@ -4753,7 +4833,7 @@ class EmlToPstConverter:
                     conversion_options.get("strict_date_preservation")
                 ),
                 conversion_options=rebuild_opts,
-                try_staged_first=False,
+                try_staged_first=True,
                 from_validation_rebuild=True,
             )
             if rebuild == "converted":
@@ -4761,16 +4841,12 @@ class EmlToPstConverter:
                     getattr(self, "_import_validation_rebuilds", 0) + 1
                 )
                 logger.info(
-                    "Import rebuilt via Items.Add after validation: %s",
+                    "Import rebuilt after validation: %s",
                     log_sanitize(file_path),
                 )
                 return "converted"
             return f"Import validation failed ({detail}); rebuild: {rebuild}"
 
-        try:
-            mail.Delete()
-        except Exception:
-            pass
         self._import_validation_failures = (
             getattr(self, "_import_validation_failures", 0) + 1
         )
@@ -4792,11 +4868,25 @@ class EmlToPstConverter:
         """
         if not self._pst_direct_import_logged:
             logger.info(
-                "PST export: Items.Add on target PST folder (fallback: store Inbox + Move) — "
-                "not OpenSharedItem / profile Outlook.pst Drafts"
+                "PST export: staged OpenSharedItem first; Items.Add fallback if staging fails"
             )
             self._pst_direct_import_logged = True
         target_folder = self._coerce_import_folder(target_folder, conversion_options)
+        namespace = outlook.GetNamespace("MAPI")
+        staged = self._try_staged_eml_import_with_dates(
+            namespace,
+            target_folder,
+            file_path,
+            conversion_options,
+            outlook=outlook,
+        )
+        if staged == "converted":
+            return "converted"
+        logger.debug(
+            "Staged PST import failed for %s (%s); using Items.Add fallback",
+            log_sanitize(file_path),
+            log_sanitize(staged),
+        )
         return self._process_single_email_manual_fallback(
             file_path,
             target_folder,
@@ -4805,7 +4895,7 @@ class EmlToPstConverter:
                 conversion_options.get("strict_date_preservation")
             ),
             conversion_options=conversion_options,
-            try_staged_first=True,
+            try_staged_first=False,
         )
 
     def _resolve_export_target_folder(self, namespace, conversion_options):
@@ -6103,6 +6193,13 @@ class EmlToPstConverter:
                     except Exception:
                         pass
                     return "Message was not saved in the target PST"
+            self._reapply_sender_from_email_data(
+                mail, email_data, file_path, conversion_options
+            )
+            try:
+                mail.Save()
+            except Exception as e:
+                logger.debug("Save after sender re-apply: %s", e)
             return self._ensure_import_quality(
                 mail,
                 file_path,
